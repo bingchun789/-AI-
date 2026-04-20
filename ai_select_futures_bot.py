@@ -8,7 +8,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -139,6 +139,8 @@ class BotConfig:
     enable_time_exit: bool
     max_hold_hours: int
     time_exit_min_pnl_pct: float
+    enable_stop_loss: bool
+    stop_loss_pct: float
     enable_profit_lock: bool
     profit_lock_tiers: str
     enable_profit_protection: bool
@@ -368,6 +370,27 @@ class BrokerAdapter:
     ) -> dict[str, Any] | None:
         return None
 
+    def ensure_stop_loss(
+        self,
+        *,
+        contract_symbol: str,
+        side: str,
+        position: dict[str, Any],
+        stop_loss_pct: float,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        stop_price = calculate_stop_loss_price(
+            position,
+            Decimal(str(stop_loss_pct)),
+        )
+        return {
+            "orderId": None,
+            "status": "DRY_RUN_PROTECTED" if dry_run else "STOP_LOSS_UNAVAILABLE",
+            "configured": stop_price is not None,
+            "stopPrice": format_decimal_value(stop_price),
+            "stopLossPct": format_decimal_value(stop_loss_pct),
+        }
+
     def close_position(
         self,
         *,
@@ -490,6 +513,27 @@ class MockBrokerAdapter(BrokerAdapter):
             "confirmedClosed": True,
             "closedAtMs": int(time.time() * 1000),
             "closeRetryCount": 0,
+        }
+
+    def ensure_stop_loss(
+        self,
+        *,
+        contract_symbol: str,
+        side: str,
+        position: dict[str, Any],
+        stop_loss_pct: float,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        stop_price = calculate_stop_loss_price(
+            position,
+            Decimal(str(stop_loss_pct)),
+        )
+        return {
+            "orderId": f"mock-stop-{int(time.time() * 1000)}-{contract_symbol}",
+            "status": "DRY_RUN_PROTECTED" if dry_run else "MOCK_PROTECTED",
+            "configured": stop_price is not None,
+            "stopPrice": format_decimal_value(stop_price),
+            "stopLossPct": format_decimal_value(stop_loss_pct),
         }
 
 
@@ -714,6 +758,121 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
         except Exception:
             logging.info("leverage_unchanged_or_failed symbol=%s", contract_symbol)
 
+    def _quantize_price(
+        self,
+        contract_symbol: str,
+        raw_price: Decimal,
+        *,
+        rounding: str,
+    ) -> Decimal:
+        meta = self._get_symbol_meta(contract_symbol)
+        price_filter = next(
+            item for item in meta.get("filters", []) if item.get("filterType") == "PRICE_FILTER"
+        )
+        tick_size = Decimal(str(price_filter["tickSize"]))
+        if tick_size == Decimal("0"):
+            return raw_price
+        steps = (raw_price / tick_size).quantize(Decimal("1"), rounding=rounding)
+        price = steps * tick_size
+        if price <= Decimal("0"):
+            raise ValueError(
+                f"{contract_symbol} stop price {price} is invalid for stop loss placement."
+            )
+        return price.normalize()
+
+    def _list_open_orders(self, contract_symbol: str) -> list[dict[str, Any]]:
+        payload = self._signed_request(
+            "GET",
+            "/fapi/v1/openOrders",
+            {"symbol": contract_symbol},
+        )
+        return payload if isinstance(payload, list) else []
+
+    def _list_open_algo_orders(self, contract_symbol: str) -> list[dict[str, Any]]:
+        payload = self._signed_request(
+            "GET",
+            "/fapi/v1/openAlgoOrders",
+            {
+                "symbol": contract_symbol,
+                "algoType": "CONDITIONAL",
+            },
+        )
+        return payload if isinstance(payload, list) else []
+
+    def _protective_stop_trigger_price(self, order: dict[str, Any]) -> Decimal | None:
+        return (
+            decimal_or_none(order.get("triggerPrice"))
+            or decimal_or_none(order.get("stopPrice"))
+            or decimal_or_none(order.get("activatePrice"))
+        )
+
+    def _is_protective_stop_order(self, order: dict[str, Any], side: str) -> bool:
+        order_type = str(
+            order.get("type") or order.get("origType") or order.get("orderType") or ""
+        ).upper()
+        if "STOP" not in order_type:
+            return False
+        close_position = str(order.get("closePosition") or "").strip().lower() == "true"
+        if not close_position:
+            return False
+        return str(order.get("side") or "").upper() == side
+
+    def _cancel_protective_stop_orders(self, contract_symbol: str, side: str) -> None:
+        order_side = "SELL" if side == LONG else "BUY"
+        for order in self._list_open_orders(contract_symbol):
+            if not self._is_protective_stop_order(order, order_side):
+                continue
+            try:
+                self._signed_request(
+                    "DELETE",
+                    "/fapi/v1/order",
+                    {
+                        "symbol": contract_symbol,
+                        "orderId": order.get("orderId"),
+                    },
+                )
+            except Exception as exc:
+                logging.warning(
+                    "stop_loss_cancel_failed symbol=%s side=%s orderId=%s error=%s",
+                    contract_symbol,
+                    side,
+                    order.get("orderId"),
+                    exc,
+                )
+        for order in self._list_open_algo_orders(contract_symbol):
+            if not self._is_protective_stop_order(order, order_side):
+                continue
+            algo_id = order.get("algoId")
+            client_algo_id = order.get("clientAlgoId")
+            if algo_id in (None, "") and client_algo_id in (None, ""):
+                logging.warning(
+                    "stop_loss_cancel_missing_algo_id symbol=%s side=%s payload=%s",
+                    contract_symbol,
+                    side,
+                    order,
+                )
+                continue
+            params: dict[str, Any] = {"symbol": contract_symbol}
+            if algo_id not in (None, ""):
+                params["algoId"] = algo_id
+            else:
+                params["clientAlgoId"] = client_algo_id
+            try:
+                self._signed_request(
+                    "DELETE",
+                    "/fapi/v1/algoOrder",
+                    params,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "stop_loss_algo_cancel_failed symbol=%s side=%s algoId=%s clientAlgoId=%s error=%s",
+                    contract_symbol,
+                    side,
+                    algo_id,
+                    client_algo_id,
+                    exc,
+                )
+
     def supported_margin_modes(self, contract_symbol: str) -> set[str]:
         return {"CROSS", "ISOLATED"}
 
@@ -749,7 +908,6 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
         self._ensure_margin_and_leverage(contract_symbol)
         quantity = self._quantize_quantity(contract_symbol, notional_usdt)
         mark_price = self.get_mark_price(contract_symbol)
-        actual_notional_usdt = float(quantity * mark_price)
         path = "/fapi/v1/order/test" if dry_run else "/fapi/v1/order"
         result = self._signed_request(
             "POST",
@@ -763,6 +921,12 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
             },
         )
         self._position_risks = None
+        entry_price = decimal_or_none(result.get("avgPrice")) or decimal_or_none(
+            result.get("price")
+        )
+        if entry_price in (None, Decimal("0")):
+            entry_price = mark_price
+        actual_notional_usdt = float(quantity * entry_price)
         return {
             "orderId": result.get("orderId") or f"test-{int(time.time() * 1000)}",
             "status": result.get("status") or ("TESTNET_ACCEPTED" if dry_run else "FILLED"),
@@ -770,7 +934,7 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
             "asset": asset,
             "notionalUsdt": actual_notional_usdt,
             "quantity": format(quantity, "f"),
-            "entryPrice": format(mark_price, "f"),
+            "entryPrice": format(entry_price, "f"),
             "metadata": metadata,
         }
 
@@ -849,6 +1013,16 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
         quantity = abs(position_amt)
         path = "/fapi/v1/order/test" if dry_run else "/fapi/v1/order"
         retry_count = 0
+        if not dry_run:
+            try:
+                self._cancel_protective_stop_orders(contract_symbol, side)
+            except Exception as exc:
+                logging.warning(
+                    "stop_loss_cancel_before_close_failed symbol=%s side=%s error=%s",
+                    contract_symbol,
+                    side,
+                    exc,
+                )
 
         def submit_close_market(close_qty: Decimal) -> dict[str, Any]:
             nonlocal retry_count
@@ -1005,6 +1179,81 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
             or int(time.time() * 1000),
             "closeRetryCount": retry_count,
             "quantity": format(quantity, "f"),
+        }
+
+    def ensure_stop_loss(
+        self,
+        *,
+        contract_symbol: str,
+        side: str,
+        position: dict[str, Any],
+        stop_loss_pct: float,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        stop_price = calculate_stop_loss_price(
+            position,
+            Decimal(str(stop_loss_pct)),
+        )
+        if stop_price is None:
+            raise ValueError(
+                f"Unable to calculate stop loss price for {contract_symbol} {side}."
+            )
+        stop_price = self._quantize_price(
+            contract_symbol,
+            stop_price,
+            rounding=ROUND_DOWN if side == LONG else ROUND_UP,
+        )
+        order_side = "SELL" if side == LONG else "BUY"
+        if dry_run:
+            return {
+                "orderId": f"dry-stop-{int(time.time() * 1000)}",
+                "status": "DRY_RUN_PROTECTED",
+                "configured": True,
+                "stopPrice": format(stop_price, "f"),
+                "stopLossPct": format_decimal_value(stop_loss_pct),
+            }
+
+        protective_orders = [
+            order
+            for order in [
+                *self._list_open_orders(contract_symbol),
+                *self._list_open_algo_orders(contract_symbol),
+            ]
+            if self._is_protective_stop_order(order, order_side)
+        ]
+        if len(protective_orders) == 1:
+            existing_stop_price = self._protective_stop_trigger_price(protective_orders[0])
+            if existing_stop_price == stop_price:
+                return {
+                    "orderId": protective_orders[0].get("orderId")
+                    or protective_orders[0].get("algoId")
+                    or protective_orders[0].get("clientAlgoId"),
+                    "status": "ALREADY_PROTECTED",
+                    "configured": True,
+                    "stopPrice": format(stop_price, "f"),
+                    "stopLossPct": format_decimal_value(stop_loss_pct),
+                }
+
+        self._cancel_protective_stop_orders(contract_symbol, side)
+        result = self._signed_request(
+            "POST",
+            "/fapi/v1/algoOrder",
+            {
+                "algoType": "CONDITIONAL",
+                "symbol": contract_symbol,
+                "side": order_side,
+                "type": "STOP_MARKET",
+                "triggerPrice": format(stop_price, "f"),
+                "closePosition": "true",
+                "workingType": "MARK_PRICE",
+            },
+        )
+        return {
+            "orderId": result.get("orderId") or result.get("algoId") or result.get("clientAlgoId"),
+            "status": result.get("algoStatus") or result.get("status") or "STOP_MARKET_PLACED",
+            "configured": True,
+            "stopPrice": format(stop_price, "f"),
+            "stopLossPct": format_decimal_value(stop_loss_pct),
         }
 
     def get_account_snapshot(self) -> dict[str, Any] | None:
@@ -1306,6 +1555,73 @@ def position_age_hours(position: dict[str, Any]) -> float | None:
     return max(0.0, (time.time() - float(opened_at)) / 3600)
 
 
+def infer_return_basis_usdt(position: dict[str, Any]) -> Decimal | None:
+    return_basis_raw = position.get("returnBasisUsdt")
+    if return_basis_raw not in (None, "", 0, "0"):
+        return_basis = abs(Decimal(str(return_basis_raw)))
+        if return_basis != Decimal("0"):
+            return return_basis
+
+    api_return_basis = extract_api_return_basis(position)
+    if api_return_basis is not None:
+        return api_return_basis
+
+    notional = decimal_or_none(position.get("notionalUsdt"))
+    leverage = decimal_or_none(position.get("leverage"))
+    if notional is not None and notional != Decimal("0"):
+        if leverage is not None and leverage > Decimal("0"):
+            estimated_margin = abs(notional) / leverage
+            if estimated_margin != Decimal("0"):
+                return estimated_margin
+        return abs(notional)
+
+    quantity = infer_position_quantity(position)
+    entry_price = decimal_or_none(position.get("entryPrice"))
+    if quantity is not None and entry_price is not None and entry_price != Decimal("0"):
+        entry_notional = abs(quantity * entry_price)
+        if leverage is not None and leverage > Decimal("0"):
+            estimated_margin = entry_notional / leverage
+            if estimated_margin != Decimal("0"):
+                return estimated_margin
+        return entry_notional
+    return None
+
+
+def calculate_stop_loss_price(
+    position: dict[str, Any],
+    stop_loss_pct: Decimal,
+) -> Decimal | None:
+    if stop_loss_pct <= Decimal("0"):
+        return None
+    quantity = infer_position_quantity(position)
+    entry_price = decimal_or_none(position.get("entryPrice"))
+    return_basis = infer_return_basis_usdt(position)
+    if quantity is None or quantity == Decimal("0") or entry_price is None or return_basis is None:
+        return None
+
+    max_loss_usdt = (return_basis * stop_loss_pct) / Decimal("100")
+    price_delta = max_loss_usdt / quantity
+    if side_from_position(position) == SHORT:
+        stop_price = entry_price + price_delta
+    else:
+        stop_price = entry_price - price_delta
+    if stop_price <= Decimal("0"):
+        return None
+    return stop_price
+
+
+def should_trigger_stop_loss(
+    *,
+    config: BotConfig,
+    current_pnl_pct: Decimal | None,
+) -> bool:
+    if not config.enable_stop_loss:
+        return False
+    if current_pnl_pct is None:
+        return False
+    return current_pnl_pct <= -Decimal(str(config.stop_loss_pct))
+
+
 def parse_profit_lock_tiers(raw_value: str) -> list[tuple[Decimal, Decimal]]:
     tiers: list[tuple[Decimal, Decimal]] = []
     for part in (raw_value or "").split(","):
@@ -1553,6 +1869,64 @@ def active_profit_lock_pct(config: BotConfig, peak_pnl_pct: Decimal | None) -> D
     return active_lock_pct
 
 
+def enrich_entry_audit_with_stop_loss(
+    *,
+    audit: dict[str, Any],
+    config: BotConfig,
+    stop_loss_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    enriched = dict(audit)
+    enriched["stopLossEnabled"] = bool(config.enable_stop_loss)
+    enriched["stopLossPct"] = format_decimal_value(config.stop_loss_pct)
+    if not config.enable_stop_loss:
+        enriched["stopLossConfigured"] = None
+        enriched["stopLossStatus"] = "disabled"
+        enriched["stopLossPrice"] = None
+        return enriched
+
+    enriched["stopLossConfigured"] = bool(
+        stop_loss_result.get("configured") if stop_loss_result else False
+    )
+    enriched["stopLossStatus"] = (
+        stop_loss_result.get("status") if stop_loss_result else "STOP_LOSS_SETUP_FAILED"
+    )
+    enriched["stopLossPrice"] = (
+        stop_loss_result.get("stopPrice") if stop_loss_result else None
+    )
+    return enriched
+
+
+def update_position_stop_loss_state(
+    *,
+    position: dict[str, Any],
+    config: BotConfig,
+    stop_loss_result: dict[str, Any] | None,
+) -> None:
+    position["stopLossEnabled"] = bool(config.enable_stop_loss)
+    position["stopLossPct"] = format_decimal_value(config.stop_loss_pct)
+    if not config.enable_stop_loss:
+        position["stopLossConfigured"] = None
+        position["stopLossStatus"] = "disabled"
+        position["stopLossPrice"] = None
+        position["stopLossOrderId"] = None
+        position["stopLossUpdatedAt"] = time.time()
+        return
+
+    position["stopLossConfigured"] = bool(
+        stop_loss_result.get("configured") if stop_loss_result else False
+    )
+    position["stopLossStatus"] = (
+        stop_loss_result.get("status") if stop_loss_result else "STOP_LOSS_SETUP_FAILED"
+    )
+    position["stopLossPrice"] = (
+        stop_loss_result.get("stopPrice") if stop_loss_result else None
+    )
+    position["stopLossOrderId"] = (
+        stop_loss_result.get("orderId") if stop_loss_result else None
+    )
+    position["stopLossUpdatedAt"] = time.time()
+
+
 def build_entry_audit_record(
     *,
     config: BotConfig,
@@ -1617,6 +1991,11 @@ def build_entry_audit_record(
         "portfolioLimitPassed": total_positions_before < int(config.max_total_open_positions),
         "openPositionsForSide": count_open_positions_for_side(state, side),
         "totalOpenPositions": count_total_open_positions(state),
+        "stopLossEnabled": bool(config.enable_stop_loss),
+        "stopLossPct": format_decimal_value(config.stop_loss_pct),
+        "stopLossConfigured": None,
+        "stopLossStatus": None,
+        "stopLossPrice": None,
     }
 
 
@@ -1663,6 +2042,11 @@ def build_exit_audit_record(
         "profitProtectionEnabled": bool(config.enable_profit_protection),
         "profitProtectionActivatePct": format_decimal_value(config.profit_protection_activate_pct),
         "profitProtectionTrailPct": format_decimal_value(config.profit_protection_trail_pct),
+        "stopLossEnabled": bool(config.enable_stop_loss),
+        "stopLossPct": format_decimal_value(config.stop_loss_pct),
+        "stopLossConfigured": position.get("stopLossConfigured"),
+        "configuredStopLossPrice": position.get("stopLossPrice"),
+        "stopLossStatus": position.get("stopLossStatus"),
         "signalLostRounds": int(position.get("signalLostRounds", 0) or 0),
         "signalLostConfirmRounds": int(config.signal_lost_exit_confirm_rounds),
         "exchangePositionMissing": reason == "exchange_position_missing",
@@ -2078,6 +2462,97 @@ def process_strategy(
             position,
             calculate_unrealized_pnl_pct(position, mark_price_raw),
         )
+        if config.enable_stop_loss:
+            stop_loss_source_position = dict(position)
+            if live_position is not None:
+                stop_loss_source_position.update(live_position)
+            try:
+                stop_loss_result = broker.ensure_stop_loss(
+                    contract_symbol=position["contractSymbol"],
+                    side=side,
+                    position=stop_loss_source_position,
+                    stop_loss_pct=config.stop_loss_pct,
+                    dry_run=config.dry_run,
+                )
+            except Exception as exc:
+                logging.exception(
+                    "stop_loss_setup_failed asset=%s symbol=%s side=%s error=%s",
+                    position["asset"],
+                    position["contractSymbol"],
+                    side,
+                    exc,
+                )
+                stop_loss_result = {
+                    "orderId": None,
+                    "status": "STOP_LOSS_SETUP_FAILED",
+                    "configured": False,
+                    "stopPrice": position.get("stopLossPrice"),
+                    "stopLossPct": format_decimal_value(config.stop_loss_pct),
+                }
+        else:
+            stop_loss_result = None
+        update_position_stop_loss_state(
+            position=position,
+            config=config,
+            stop_loss_result=stop_loss_result,
+        )
+        if should_trigger_stop_loss(
+            config=config,
+            current_pnl_pct=tracking["current"],
+        ):
+            exit_audit = build_exit_audit_record(
+                config=config,
+                position=position,
+                reason="stop_loss",
+                tracking=tracking,
+            )
+            close_result = broker.close_position(
+                contract_symbol=position["contractSymbol"],
+                asset=position["asset"],
+                side=side,
+                position=position,
+                dry_run=config.dry_run,
+            )
+            if not is_close_result_success(close_result):
+                decisions.append(
+                    build_close_failed_decision(
+                        position=position,
+                        side=side,
+                        attempted_reason="stop_loss",
+                        close_result=close_result,
+                    )
+                )
+                continue
+            exit_event = build_exit_record(
+                asset=position["asset"],
+                side=side,
+                strategy_id=strategy_id,
+                position=position,
+                close_result=close_result,
+                reason="stop_loss",
+                fee_rate=fee_rate,
+                audit=exit_audit,
+            )
+            state.setdefault("history", []).append(exit_event)
+            state.get("positions", {}).pop(key, None)
+            decisions.append(
+                {
+                    "asset": position["asset"],
+                    "side": side,
+                    "action": exit_action(side),
+                    "contractSymbol": position["contractSymbol"],
+                    "status": close_result["status"],
+                    "reason": "stop_loss",
+                    "realizedPnlUsdt": exit_event["realizedPnlUsdt"],
+                    "netRealizedPnlUsdt": exit_event["netRealizedPnlUsdt"],
+                    "closeSide": exit_event["closeSide"],
+                    "currentPnlPct": format(tracking["current"], "f")
+                    if tracking["current"] is not None
+                    else None,
+                }
+            )
+            closed += 1
+            continue
         if should_trigger_profit_lock(
             config=config,
             position=position,
@@ -2389,6 +2864,38 @@ def process_strategy(
                         item=item,
                         config=config,
                     )
+                    if config.enable_stop_loss:
+                        synced_position = state.get("positions", {}).get(key)
+                        if isinstance(synced_position, dict):
+                            stop_loss_result = None
+                            try:
+                                stop_loss_result = broker.ensure_stop_loss(
+                                    contract_symbol=contract["symbol"],
+                                    side=side,
+                                    position={**synced_position, **live_position},
+                                    stop_loss_pct=config.stop_loss_pct,
+                                    dry_run=config.dry_run,
+                                )
+                            except Exception as exc:
+                                logging.exception(
+                                    "synced_position_stop_loss_failed asset=%s symbol=%s side=%s error=%s",
+                                    asset,
+                                    contract["symbol"],
+                                    side,
+                                    exc,
+                                )
+                                stop_loss_result = {
+                                    "orderId": None,
+                                    "status": "STOP_LOSS_SETUP_FAILED",
+                                    "configured": False,
+                                    "stopPrice": synced_position.get("stopLossPrice"),
+                                    "stopLossPct": format_decimal_value(config.stop_loss_pct),
+                                }
+                            update_position_stop_loss_state(
+                                position=synced_position,
+                                config=config,
+                                stop_loss_result=stop_loss_result,
+                            )
             decisions.append(
                 {"asset": asset, "side": side, "action": "hold", "reason": signal_hold_reason(side)}
             )
@@ -2669,7 +3176,7 @@ def process_strategy(
             )
             continue
 
-        state.setdefault("positions", {})[position_key(asset, side)] = {
+        opened_position = {
             "asset": asset,
             "contractSymbol": contract["symbol"],
             "openedAt": time.time(),
@@ -2682,14 +3189,55 @@ def process_strategy(
             "dryRun": config.dry_run,
             "requiredMarginMode": config.required_margin_mode,
             "leverage": config.leverage,
+            "returnBasisUsdt": None,
             "maxProfitPct": "0",
             "minPnlPct": "0",
             "lastPnlPct": "0",
             "signalLostRounds": 0,
             "side": side,
             "strategyId": strategy_id,
-            "entryAudit": entry_audit,
         }
+        opened_position["returnBasisUsdt"] = format_decimal_value(
+            infer_return_basis_usdt(opened_position)
+        )
+        if config.enable_stop_loss:
+            try:
+                stop_loss_result = broker.ensure_stop_loss(
+                    contract_symbol=contract["symbol"],
+                    side=side,
+                    position=opened_position,
+                    stop_loss_pct=config.stop_loss_pct,
+                    dry_run=config.dry_run,
+                )
+            except Exception as exc:
+                logging.exception(
+                    "entry_stop_loss_setup_failed asset=%s symbol=%s side=%s error=%s",
+                    asset,
+                    contract["symbol"],
+                    side,
+                    exc,
+                )
+                stop_loss_result = {
+                    "orderId": None,
+                    "status": "STOP_LOSS_SETUP_FAILED",
+                    "configured": False,
+                    "stopPrice": None,
+                    "stopLossPct": format_decimal_value(config.stop_loss_pct),
+                }
+        else:
+            stop_loss_result = None
+        update_position_stop_loss_state(
+            position=opened_position,
+            config=config,
+            stop_loss_result=stop_loss_result,
+        )
+        entry_audit = enrich_entry_audit_with_stop_loss(
+            audit=entry_audit,
+            config=config,
+            stop_loss_result=stop_loss_result,
+        )
+        opened_position["entryAudit"] = entry_audit
+        state.setdefault("positions", {})[position_key(asset, side)] = opened_position
         state.setdefault("history", []).append(
             {
                 "timestamp": time.time(),
@@ -2700,6 +3248,10 @@ def process_strategy(
                 "action": enter_action(side),
                 "status": order_result["status"],
                 "reason": signal_enter_reason(side),
+                "entryPrice": order_result.get("entryPrice"),
+                "quantity": order_result.get("quantity"),
+                "stopLossPrice": opened_position.get("stopLossPrice"),
+                "stopLossStatus": opened_position.get("stopLossStatus"),
                 "auditVersion": 1,
                 "audit": entry_audit,
             }
@@ -2713,6 +3265,8 @@ def process_strategy(
                 "status": order_result["status"],
                 "score": get_score(item),
                 "quantity": order_result.get("quantity"),
+                "stopLossPrice": opened_position.get("stopLossPrice"),
+                "stopLossStatus": opened_position.get("stopLossStatus"),
             }
         )
         opened += 1
@@ -2942,6 +3496,8 @@ def build_config(workdir: Path) -> BotConfig:
         enable_time_exit=get_env_bool("ENABLE_TIME_EXIT", True),
         max_hold_hours=int(os.getenv("MAX_HOLD_HOURS", "48")),
         time_exit_min_pnl_pct=float(os.getenv("TIME_EXIT_MIN_PNL_PCT", "5")),
+        enable_stop_loss=get_env_bool("ENABLE_STOP_LOSS", True),
+        stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "32")),
         enable_profit_lock=get_env_bool("ENABLE_PROFIT_LOCK", True),
         profit_lock_tiers=os.getenv("PROFIT_LOCK_TIERS", "4:2,8:5,12:8"),
         enable_profit_protection=get_env_bool("ENABLE_PROFIT_PROTECTION", True),

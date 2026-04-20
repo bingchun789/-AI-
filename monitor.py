@@ -408,6 +408,194 @@ def _check_min_signal_filter(
             )
 
 
+def _entry_audit_toggle_config_mismatches(
+    audit: dict[str, Any],
+    *,
+    config: Any,
+) -> list[str]:
+    failures: list[str] = []
+    expected_flags = [
+        ("minSignalFilterEnabled", bool(config.enable_min_signal_count_filter), "最少强信号数过滤"),
+        ("marginModeCheckEnabled", bool(config.skip_if_margin_mode_unavailable), "保证金模式校验"),
+        ("marginUsageCapEnabled", bool(config.enable_margin_usage_cap), "保证金占用上限"),
+        ("volatilityFilterEnabled", bool(config.enable_volatility_filter), "波动率过滤"),
+        ("fundingRateFilterEnabled", bool(config.enable_funding_rate_filter), "资金费过滤"),
+        ("correlationFilterEnabled", bool(config.enable_correlation_filter), "相关性过滤"),
+        ("trendConfirmationEnabled", bool(config.enable_trend_confirmation), "趋势确认"),
+        ("stopLossEnabled", bool(config.enable_stop_loss), "硬止损"),
+    ]
+    for field, expected, label in expected_flags:
+        actual = audit.get(field)
+        if actual is None:
+            continue
+        if bool(actual) != expected:
+            failures.append(f"{label} 开关记录为 {actual}，当前配置应为 {expected}")
+    stop_loss_pct = _to_decimal(audit.get("stopLossPct"))
+    expected_stop_loss_pct = Decimal(str(config.stop_loss_pct))
+    if (
+        bool(config.enable_stop_loss)
+        and stop_loss_pct is not None
+        and stop_loss_pct != expected_stop_loss_pct
+    ):
+        failures.append(
+            f"硬止损阈值记录为 {stop_loss_pct}% ，当前配置应为 {expected_stop_loss_pct}%"
+        )
+    return failures
+
+
+def _disabled_toggle_decision_failures(decision: dict[str, Any], config: Any) -> list[str]:
+    reason = str(decision.get("reason") or "")
+    failures: list[str] = []
+    if reason == "signal_count_too_low" and not bool(config.enable_min_signal_count_filter):
+        failures.append("最少强信号数过滤已关闭，但本轮仍因该规则跳过开仓")
+    if reason == "margin_usage_limit" and not bool(config.enable_margin_usage_cap):
+        failures.append("保证金占用上限已关闭，但本轮仍因该规则跳过开仓")
+    if reason == "high_volatility" and not bool(config.enable_volatility_filter):
+        failures.append("波动率过滤已关闭，但本轮仍因该规则跳过开仓")
+    if reason == "funding_too_high" and not bool(config.enable_funding_rate_filter):
+        failures.append("资金费过滤已关闭，但本轮仍因该规则跳过开仓")
+    if reason == "correlated_with_existing" and not bool(config.enable_correlation_filter):
+        failures.append("相关性过滤已关闭，但本轮仍因该规则跳过开仓")
+    if reason in {"trend_not_confirmed", "trend_data_unavailable"} and not bool(
+        config.enable_trend_confirmation
+    ):
+        failures.append("趋势确认已关闭，但本轮仍因趋势规则拦截开仓")
+    if reason == "signal_drop_guard" and not bool(config.enable_signal_drop_guard):
+        failures.append("信号骤降保护已关闭，但本轮仍因该规则阻止平仓")
+    if reason.startswith("margin_mode_missing:") and not bool(
+        config.skip_if_margin_mode_unavailable
+    ):
+        failures.append("保证金模式校验已关闭，但本轮仍因该规则跳过开仓")
+    return failures
+
+
+def _check_strategy_toggle_enforcement(
+    *,
+    issues: list[dict[str, Any]],
+    now: float,
+    strategy_statuses: dict[str, Any],
+    config: Any,
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    checked_count = 0
+    issue_count = 0
+    missing_audit_count = 0
+
+    for strategy_id, status in strategy_statuses.items():
+        if not isinstance(status, dict):
+            continue
+        side = status.get("side", LONG)
+        open_action = enter_action(side)
+        for decision in status.get("latestDecisions") or []:
+            if not isinstance(decision, dict):
+                continue
+
+            disabled_toggle_failures = _disabled_toggle_decision_failures(decision, config)
+            if disabled_toggle_failures:
+                checked_count += 1
+                issue_count += 1
+                detail = "；".join(disabled_toggle_failures[:3])
+                records.append(
+                    {
+                        "strategyId": strategy_id,
+                        "asset": decision.get("asset"),
+                        "side": side,
+                        "action": decision.get("action"),
+                        "status": "error",
+                        "details": detail,
+                    }
+                )
+                _add_issue(
+                    issues,
+                    now=now,
+                    level="error",
+                    rule="strategy_toggle_enforcement_failed",
+                    title="策略开关执行异常",
+                    detail=f"{strategy_id} {decision.get('asset') or '-'}：{detail}",
+                    context={
+                        "strategyId": strategy_id,
+                        "asset": decision.get("asset"),
+                        "side": side,
+                        "action": decision.get("action"),
+                    },
+                )
+                continue
+
+            if decision.get("action") != open_action:
+                continue
+
+            checked_count += 1
+            audit = decision.get("entryAudit")
+            if not isinstance(audit, dict):
+                missing_audit_count += 1
+                records.append(
+                    {
+                        "strategyId": strategy_id,
+                        "asset": decision.get("asset"),
+                        "side": side,
+                        "action": decision.get("action"),
+                        "status": "missing",
+                        "details": "当前轮开仓决策缺少 entryAudit",
+                    }
+                )
+                _add_issue(
+                    issues,
+                    now=now,
+                    level="warn",
+                    rule="strategy_toggle_audit_missing",
+                    title="当前轮开仓缺少开关审计",
+                    detail=f"{strategy_id} {decision.get('asset') or '-'} 当前轮开仓缺少 entryAudit。",
+                    context={
+                        "strategyId": strategy_id,
+                        "asset": decision.get("asset"),
+                        "side": side,
+                    },
+                )
+                continue
+
+            failures = [
+                *_entry_audit_toggle_config_mismatches(audit, config=config),
+                *_entry_audit_failures(audit),
+            ]
+            status_text = "error" if failures else "ok"
+            records.append(
+                {
+                    "strategyId": strategy_id,
+                    "asset": decision.get("asset"),
+                    "side": side,
+                    "action": decision.get("action"),
+                    "status": status_text,
+                    "details": "；".join(failures[:3]) if failures else "通过",
+                }
+            )
+            if not failures:
+                continue
+
+            issue_count += 1
+            _add_issue(
+                issues,
+                now=now,
+                level="error",
+                rule="strategy_toggle_enforcement_failed",
+                title="策略开关执行异常",
+                detail=f"{strategy_id} {decision.get('asset') or '-'}：{'；'.join(failures[:3])}",
+                context={
+                    "strategyId": strategy_id,
+                    "asset": decision.get("asset"),
+                    "side": side,
+                    "action": decision.get("action"),
+                },
+            )
+
+    return {
+        "checked": True,
+        "checkedCount": checked_count,
+        "issueCount": issue_count,
+        "missingAuditCount": missing_audit_count,
+        "records": records[:20],
+    }
+
+
 def _check_cooldown_violations(
     *,
     issues: list[dict[str, Any]],
@@ -415,7 +603,7 @@ def _check_cooldown_violations(
     state: dict[str, Any],
     cooldown_minutes: int,
 ) -> None:
-    cooldown_seconds = int(cooldown_minutes * 60)
+    default_cooldown_seconds = int(cooldown_minutes * 60)
     last_exit_at: dict[tuple[str, str], float] = {}
     ordered_history = sorted(state.get("history", []), key=lambda item: item.get("timestamp", 0))
     for event in ordered_history:
@@ -438,6 +626,20 @@ def _check_cooldown_violations(
         if previous_exit_ts is None:
             continue
         delta = event_ts - previous_exit_ts
+        audit = event.get("audit") if isinstance(event.get("audit"), dict) else {}
+        event_cooldown_minutes = audit.get("cooldownMinutes")
+        if event_cooldown_minutes in (None, ""):
+            # Legacy history records may not carry entry-audit fields; skip
+            # retrospective cooldown judgments for those rows.
+            continue
+        try:
+            cooldown_seconds = (
+                int(float(event_cooldown_minutes) * 60)
+                if event_cooldown_minutes not in (None, "")
+                else default_cooldown_seconds
+            )
+        except Exception:
+            cooldown_seconds = default_cooldown_seconds
         if delta < cooldown_seconds:
             _add_issue(
                 issues,
@@ -798,6 +1000,15 @@ def _inspect_bot_runtime(
         if record.get("timestamp") not in (None, "")
         and now - float(record["timestamp"]) <= recent_window_seconds
     ][:10]
+    unresolved_recent_failures = recent_failures
+    if latest_success and latest_success.get("timestamp") not in (None, ""):
+        latest_success_ts = float(latest_success["timestamp"])
+        unresolved_recent_failures = [
+            item
+            for item in recent_failures
+            if item.get("timestamp") not in (None, "")
+            and float(item["timestamp"]) >= latest_success_ts
+        ]
     result = {
         "checked": paths["bot_log"].exists(),
         "ok": success_age is not None and success_age <= stale_threshold,
@@ -848,17 +1059,17 @@ def _inspect_bot_runtime(
                 "staleThresholdSeconds": stale_threshold,
             },
         )
-    if recent_failures:
-        latest = recent_failures[0]
+    if unresolved_recent_failures:
+        latest = unresolved_recent_failures[0]
         _add_issue(
             issues,
             now=now,
             level="warn",
             rule="bot_recent_failures",
             title="Bot 最近出现异常",
-            detail=f"最近 {recent_window_seconds // 3600} 小时内发现 {len(recent_failures)} 条异常，最新一条：{latest['message']}",
+            detail=f"最近一次成功轮询后仍发现 {len(unresolved_recent_failures)} 条异常，最新一条：{latest['message']}",
             context={
-                "recentFailureCount": len(recent_failures),
+                "recentFailureCount": len(unresolved_recent_failures),
                 "latestFailureAt": latest.get("timestampText"),
                 "logPath": paths["bot_log"].as_posix(),
             },
@@ -985,6 +1196,8 @@ def _entry_audit_failures(audit: dict[str, Any]) -> list[str]:
     if audit.get("correlationFilterEnabled") and audit.get("correlationPassed") is False:
         correlated_symbol = audit.get("correlatedSymbol") or "-"
         failures.append(f"与现有持仓 {correlated_symbol} 相关性过高")
+    if audit.get("stopLossEnabled") and not audit.get("stopLossConfigured"):
+        failures.append("硬止损未配置成功")
     opened_before = int(audit.get("openedBefore", 0) or 0)
     cycle_limit = int(audit.get("cycleLimit", 0) or 0)
     if cycle_limit > 0 and opened_before >= cycle_limit:
@@ -998,6 +1211,19 @@ def _entry_audit_failures(audit: dict[str, Any]) -> list[str]:
     if portfolio_limit > 0 and portfolio_positions_before >= portfolio_limit:
         failures.append(f"总持仓 {portfolio_positions_before} 达到阈值 {portfolio_limit}")
     return failures
+
+
+def _entry_stop_loss_recovered(state: dict[str, Any], event: dict[str, Any]) -> bool:
+    asset = event.get("asset")
+    side = event.get("side")
+    if asset in (None, "") or side not in {LONG, SHORT}:
+        return False
+    for position in (state.get("positions") or {}).values():
+        if not isinstance(position, dict):
+            continue
+        if position.get("asset") == asset and position.get("side") == side:
+            return bool(position.get("stopLossConfigured"))
+    return False
 
 
 def _check_entry_execution_audit(
@@ -1020,6 +1246,8 @@ def _check_entry_execution_audit(
         if isinstance(audit, dict):
             audited_count += 1
             failures = _entry_audit_failures(audit)
+            if "硬止损未配置成功" in failures and _entry_stop_loss_recovered(state, event):
+                failures = [failure for failure in failures if failure != "硬止损未配置成功"]
             status = "error" if failures else "ok"
         else:
             missing_audit_count += 1
@@ -1064,6 +1292,8 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
     peak_pnl_pct = _to_decimal(audit.get("peakPnlPct"))
     age_hours = audit.get("ageHours")
     if reason == "profit_lock":
+        if not audit.get("profitLockEnabled"):
+            failures.append("分级锁盈已关闭却仍然触发该平仓")
         active_lock_pct = _to_decimal(audit.get("activeProfitLockPct"))
         if active_lock_pct is None:
             failures.append("未记录有效止盈锁阈值")
@@ -1074,6 +1304,8 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
         if peak_pnl_pct is None:
             failures.append("未记录峰值收益")
     elif reason == "profit_retrace":
+        if not audit.get("profitProtectionEnabled"):
+            failures.append("利润保护已关闭却仍然触发该平仓")
         activate_pct = _to_decimal(audit.get("profitProtectionActivatePct"))
         trail_pct = _to_decimal(audit.get("profitProtectionTrailPct"))
         drawdown_ratio_pct = _to_decimal(audit.get("drawdownRatioPct"))
@@ -1082,6 +1314,8 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
         if drawdown_ratio_pct is None or trail_pct is None or drawdown_ratio_pct < trail_pct:
             failures.append("回撤比例未达到保护性止盈阈值")
     elif reason == "time_exit":
+        if not audit.get("timeExitEnabled"):
+            failures.append("时间退出已关闭却仍然触发该平仓")
         max_hold_hours = float(audit.get("maxHoldHours", 0) or 0)
         time_exit_min_pnl_pct = _to_decimal(audit.get("timeExitMinPnlPct"))
         if age_hours is None or float(age_hours) < max_hold_hours:
@@ -1099,6 +1333,22 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
         confirm_rounds = int(audit.get("signalLostConfirmRounds", 0) or 0)
         if confirm_rounds > 0 and rounds < confirm_rounds:
             failures.append(f"信号丢失轮数 {rounds} 小于确认轮数 {confirm_rounds}")
+    elif reason == "stop_loss":
+        if not audit.get("stopLossEnabled"):
+            failures.append("硬止损已关闭却仍然触发该平仓")
+        stop_loss_pct = _to_decimal(audit.get("stopLossPct"))
+        if stop_loss_pct is None:
+            failures.append("未记录硬止损阈值")
+        elif current_pnl_pct is None or current_pnl_pct > -stop_loss_pct:
+            failures.append(
+                f"当前收益 {audit.get('currentPnlPct') or '-'} 未跌破止损阈值 -{audit.get('stopLossPct') or '-'}"
+            )
+        stop_loss_configured = audit.get("stopLossConfigured")
+        if stop_loss_configured is None:
+            stop_loss_status = str(audit.get("stopLossStatus") or "").upper()
+            stop_loss_configured = stop_loss_status not in {"", "DISABLED", "STOP_LOSS_SETUP_FAILED"}
+        if bool(stop_loss_configured) and audit.get("configuredStopLossPrice") in (None, ""):
+            failures.append("已配置硬止损但未记录止损价格")
     elif reason == "exchange_position_missing":
         if not audit.get("exchangePositionMissing"):
             failures.append("未记录交易所持仓缺失事实")
@@ -1619,6 +1869,12 @@ def run_monitor_once(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]
         now=now,
         state=state,
     )
+    strategy_toggle_audit = _check_strategy_toggle_enforcement(
+        issues=issues,
+        now=now,
+        strategy_statuses=strategy_statuses,
+        config=config,
+    )
     exit_execution_audit = _check_exit_execution_audit(
         issues=issues,
         now=now,
@@ -1634,6 +1890,7 @@ def run_monitor_once(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]
     )
     trade_audits = {
         "entryExecution": entry_execution_audit,
+        "strategyToggleEnforcement": strategy_toggle_audit,
         "exitExecution": exit_execution_audit,
         "pendingExit": pending_exit_audit,
     }

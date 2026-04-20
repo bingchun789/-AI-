@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import threading
 import time
 import webbrowser
@@ -8,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from ai_select_futures_bot import build_config, live_side_from_amount, load_dotenv, select_broker_adapter
 from view_status import build_report
 
 
@@ -20,10 +23,15 @@ CONFIG_TOGGLE_KEYS = {
     "ENABLE_CORRELATION_FILTER",
     "ENABLE_TREND_CONFIRMATION",
     "ENABLE_TIME_EXIT",
+    "ENABLE_STOP_LOSS",
     "ENABLE_PROFIT_LOCK",
     "ENABLE_PROFIT_PROTECTION",
     "ENABLE_SIGNAL_DROP_GUARD",
     "SKIP_IF_MARGIN_MODE_UNAVAILABLE",
+}
+
+CONFIG_VALUE_KEYS = {
+    "COOLDOWN_MINUTES",
 }
 
 
@@ -53,10 +61,16 @@ HTML = """<!doctype html>
       --shadow-soft: 0 10px 24px rgba(87,64,38,.08);
     }
     * { box-sizing: border-box; }
+    html {
+      max-width: 100%;
+      overflow-x: hidden;
+    }
     body {
       margin: 0;
       font-family: "Avenir Next","PingFang SC","Microsoft YaHei",sans-serif;
       color: var(--text);
+      max-width: 100%;
+      overflow-x: hidden;
       background:
         radial-gradient(circle at top left, rgba(183,93,42,.18), transparent 34%),
         radial-gradient(circle at top right, rgba(27,127,121,.16), transparent 28%),
@@ -83,31 +97,57 @@ HTML = """<!doctype html>
       backdrop-filter: blur(12px);
     }
     .hero-main {
-      padding: 18px 22px;
+      padding: 24px 24px 20px;
       align-self: start;
+      display: grid;
+      align-content: start;
+      gap: 10px;
+      min-height: 220px;
     }
     .hero-side {
       padding: 16px 18px;
       align-self: start;
-      display: flex;
-      flex-direction: column;
-      justify-content: flex-start;
-      gap: 12px;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      align-content: start;
+      gap: 14px;
+      min-height: 220px;
     }
-    .hero-side-stats {
+    .hero-main h1 {
+      margin: 2px 0 4px;
+      font-size: 30px;
+      line-height: 1.08;
+      letter-spacing: -.02em;
+    }
+    .hero-main p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+      font-size: 15px;
+      max-width: 720px;
+    }
+    .hero-side-head {
       display: grid;
       gap: 10px;
     }
+    .hero-side-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      align-self: end;
+    }
     .hero-stat {
       display: flex;
-      align-items: center;
+      flex-direction: column;
+      align-items: flex-start;
       justify-content: space-between;
-      gap: 14px;
+      gap: 8px;
       padding: 12px 14px;
       border-radius: 16px;
       background: rgba(255,255,255,.72);
       border: 1px solid var(--line);
       box-shadow: var(--shadow-soft);
+      min-height: 86px;
     }
     .hero-stat-label {
       color: var(--muted);
@@ -117,10 +157,10 @@ HTML = """<!doctype html>
       text-transform: uppercase;
     }
     .hero-stat-value {
-      font-size: 16px;
+      font-size: 18px;
       font-weight: 700;
       color: var(--text);
-      text-align: right;
+      text-align: left;
     }
     .eyebrow {
       display: inline-flex;
@@ -135,23 +175,11 @@ HTML = """<!doctype html>
       letter-spacing: .08em;
       text-transform: uppercase;
     }
-    .hero h1 {
-      margin: 12px 0 8px;
-      font-size: 28px;
-      line-height: 1.12;
-    }
-    .hero p {
-      margin: 0;
-      color: var(--muted);
-      line-height: 1.6;
-      font-size: 14px;
-      max-width: 700px;
-    }
     .hero-tags {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      margin-top: 12px;
+      margin-top: 6px;
     }
     .soft-pill {
       display: inline-flex;
@@ -176,33 +204,57 @@ HTML = """<!doctype html>
       font-weight: 600;
       font-size: 13px;
     }
-    .hero-side-copy {
-      display: grid;
-      gap: 8px;
+    .hero-status {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      min-height: 58px;
+      padding: 12px 14px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.78);
+      box-shadow: var(--shadow-soft);
+      color: var(--muted);
+      transition: background .2s ease, border-color .2s ease, color .2s ease;
     }
-    .hero-side-title {
+    .hero-status.is-live {
+      background: rgba(255,255,255,.78);
+      border-color: var(--line);
+      color: var(--muted);
+    }
+    .hero-status.is-refreshing {
+      background: rgba(184,104,61,.10);
+      border-color: rgba(184,104,61,.22);
+      color: #a45a30;
+    }
+    .hero-status.is-warning {
+      background: rgba(180,35,24,.08);
+      border-color: rgba(180,35,24,.18);
+      color: var(--bad);
+    }
+    .hero-status-dot {
+      width: 10px;
+      height: 10px;
+      margin-top: 5px;
+      border-radius: 50%;
+      background: currentColor;
+      flex: 0 0 auto;
+      opacity: .92;
+    }
+    .hero-status-copy {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .hero-status-copy strong {
       font-size: 12px;
       font-weight: 700;
       letter-spacing: .04em;
       text-transform: uppercase;
-      color: var(--muted);
     }
-    .hero-side-note {
-      margin: 0;
-      color: var(--muted);
-      line-height: 1.55;
+    .hero-status-copy span {
       font-size: 13px;
-    }
-    .warn-banner {
-      display: none;
-      margin-bottom: 18px;
-      padding: 14px 16px;
-      border-radius: 18px;
-      background: rgba(180,35,24,.08);
-      border: 1px solid rgba(180,35,24,.18);
-      color: var(--bad);
-      font-size: 14px;
-      box-shadow: var(--shadow-soft);
+      line-height: 1.5;
     }
     .grid {
       display: grid;
@@ -230,6 +282,7 @@ HTML = """<!doctype html>
       padding: 18px;
       box-shadow: var(--shadow);
       backdrop-filter: blur(10px);
+      min-width: 0;
     }
     .metric-card {
       background: linear-gradient(180deg, rgba(255,255,255,.86), rgba(255,251,245,.72));
@@ -313,6 +366,19 @@ HTML = """<!doctype html>
       grid-template-columns: repeat(12, minmax(0, 1fr));
       gap: 14px;
       align-items: start;
+    }
+    .settings-stack {
+      max-width: 1120px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .rule-summary-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .rule-summary-list .mini-item {
+      min-height: 100%;
     }
     .col-2 { grid-column: span 2; }
     .col-3 { grid-column: span 3; }
@@ -429,7 +495,11 @@ HTML = """<!doctype html>
     }
     .rule-name { color: var(--muted); min-width: 92px; }
     .rule-value { text-align: right; font-weight: 600; }
-    .table-wrap { overflow-x: auto; }
+    .table-wrap {
+      overflow-x: auto;
+      max-width: 100%;
+      min-width: 0;
+    }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
     th, td {
       text-align: left;
@@ -440,6 +510,46 @@ HTML = """<!doctype html>
     th { color: var(--muted); font-weight: 600; }
     .good { color: var(--good); font-weight: 700; }
     .bad { color: var(--bad); font-weight: 700; }
+    #monitorWrap,
+    .monitor-report {
+      max-width: 100%;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .monitor-card {
+      width: 100%;
+      margin: 0;
+    }
+    .monitor-report .mini-list {
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+    .monitor-report .rule-row {
+      flex-wrap: wrap;
+    }
+    .monitor-report .rule-name,
+    .monitor-report .rule-value {
+      min-width: 0;
+    }
+    .monitor-report .rule-value {
+      text-align: left;
+      overflow-wrap: anywhere;
+    }
+    .monitor-report .table-wrap {
+      overflow-x: auto;
+    }
+    .monitor-report table {
+      table-layout: fixed;
+      font-size: 13px;
+    }
+    .monitor-report th,
+    .monitor-report td,
+    .monitor-report .sub,
+    .monitor-report .empty {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      vertical-align: top;
+    }
     .pill {
       display: inline-block;
       padding: 6px 10px;
@@ -522,6 +632,28 @@ HTML = """<!doctype html>
     .toggle-copy { flex: 1; min-width: 0; }
     .toggle-name { font-weight: 700; margin-bottom: 4px; }
     .toggle-detail { color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .config-control {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .config-number-input {
+      width: 96px;
+      border: 1px solid rgba(24,32,40,.14);
+      border-radius: 12px;
+      padding: 9px 11px;
+      background: rgba(255,255,255,.92);
+      color: var(--text);
+      font: inherit;
+      text-align: right;
+    }
+    .config-number-unit {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
     .switch {
       position: relative;
       width: 52px;
@@ -568,12 +700,19 @@ HTML = """<!doctype html>
       .grid, .triple, .highlights, .panels { grid-template-columns: 1fr; }
       .hero { grid-template-columns: 1fr; }
       .dashboard-grid { grid-template-columns: 1fr; }
+      .rule-summary-list { grid-template-columns: 1fr; }
       .col-2, .col-3, .col-4, .col-5, .col-6, .col-7, .col-8, .col-12 { grid-column: span 1; }
       .strategy-grid { grid-template-columns: 1fr; }
-      .hero-main, .hero-side { padding: 16px; }
-      .hero h1 { font-size: 24px; }
+      .hero-main, .hero-side {
+        padding: 16px;
+        min-height: 0;
+      }
+      .hero-main h1 { font-size: 24px; }
+      .hero-side-stats { grid-template-columns: 1fr; }
       .stamp { width: 100%; }
       .tab-bar { top: 8px; }
+      .toggle-item { align-items: flex-start; flex-wrap: wrap; }
+      .config-control { width: 100%; justify-content: flex-start; }
     }
   </style>
 </head>
@@ -628,10 +767,15 @@ HTML = """<!doctype html>
             </div>
           </div>
           <div class="hero-side col-5">
-            <div class="stamp" id="stamp">加载中...</div>
-            <div class="hero-side-copy">
-              <div class="hero-side-title">快速判断</div>
-              <p class="hero-side-note">这一屏只做快速扫一眼。仓位明细去持仓页，策略判断去策略页，记录和回撤也都拆开了，不再混在总览里。</p>
+            <div class="hero-side-head">
+              <div class="stamp" id="stamp">加载中...</div>
+              <div class="hero-status is-live" id="syncStatus">
+                <span class="hero-status-dot"></span>
+                <div class="hero-status-copy">
+                  <strong>同步状态</strong>
+                  <span id="syncStatusText">数据正在初始化...</span>
+                </div>
+              </div>
             </div>
             <div class="hero-side-stats">
               <div class="hero-stat">
@@ -644,8 +788,6 @@ HTML = """<!doctype html>
               </div>
             </div>
           </div>
-
-          <div class="warn-banner col-12" id="warnBanner"></div>
 
           <div class="card metric-card metric-primary col-3"><div class="label">当前总浮盈亏</div><div class="value" id="totalPnl">-</div><div class="sub">币安返回的未实现盈亏（USDT）</div></div>
           <div class="card metric-card metric-primary col-3"><div class="label">当前总持仓价值</div><div class="value" id="totalValue">-</div><div class="sub">按标记价格合计（USDT）</div></div>
@@ -725,7 +867,7 @@ HTML = """<!doctype html>
 
       <section class="tab-panel" data-panel="monitor" role="tabpanel">
         <div class="section-stack">
-          <div class="card">
+          <div class="card monitor-card">
             <div class="label">系统巡检</div>
             <div class="sub" id="monitorMeta">巡检会检查规则偏差、冷却违规、持仓不一致等问题。</div>
             <div id="monitorWrap"></div>
@@ -757,9 +899,8 @@ HTML = """<!doctype html>
       </section>
 
       <section class="tab-panel" data-panel="settings" role="tabpanel">
-        <div class="dashboard-grid">
-          <div class="card card-table col-6"><div class="label">基本规则</div><div class="mini-list" id="ruleSummaryWrap"></div></div>
-          <div class="card card-table col-6">
+        <div class="section-stack settings-stack">
+          <div class="card card-table">
             <div class="action-row">
               <div>
                 <div class="label">策略开关</div>
@@ -769,32 +910,9 @@ HTML = """<!doctype html>
             </div>
             <div id="configToggleWrap"></div>
           </div>
-
-          <div class="card tip-card card-equal col-6">
-            <div class="label">操作提醒</div>
-            <div class="tip-list">
-              <div class="tip-row">
-                <strong>修改开关后</strong>
-                <div class="tab-empty-note">页面会立即刷新，但策略实际生效要等机器人下一个轮询周期。</div>
-              </div>
-              <div class="tip-row">
-                <strong>刷新较慢时</strong>
-                <div class="tab-empty-note">看板会先显示最近一次成功缓存，不会因为单次接口慢就整页卡住。</div>
-              </div>
-            </div>
-          </div>
-          <div class="card tip-card card-equal col-6">
-            <div class="label">实盘建议</div>
-            <div class="mini-list">
-              <div class="mini-item">
-                <div class="mini-title">怎么看</div>
-                <div>准入清单全部满足后，再考虑极小仓位接入实盘。优先看持仓是否对账、平仓是否确认、样本量是否足够。</div>
-              </div>
-              <div class="mini-item">
-                <div class="mini-title">建议顺序</div>
-                <div>先继续跑模拟盘，再小仓位实盘，最后再逐步放大，不要直接满额切过去。</div>
-              </div>
-            </div>
+          <div class="card card-table">
+            <div class="label">基本规则</div>
+            <div class="mini-list" id="ruleSummaryWrap"></div>
           </div>
         </div>
       </section>
@@ -897,9 +1015,14 @@ HTML = """<!doctype html>
         signal_lost: '掉出当前列表',
         snapshot_protection: '快照保护（上轮仍在列表，本轮抓取可能遗漏）',
         signal_drop_guard: '信号骤降保护',
+        enter_long: '开多',
+        enter_short: '开空',
+        skip: '跳过',
+        hold: '持有',
         profit_lock: '分级锁盈平仓',
         profit_retrace: '盈利回撤保护平仓',
         time_exit: '持仓时间过长平仓',
+        stop_loss: '触发硬止损平仓',
         exchange_position_missing: '交易所侧持仓已消失',
         still_strong_positive: '仍在强烈看多列表',
         still_strong_negative: '仍在强烈看空列表',
@@ -1211,14 +1334,18 @@ HTML = """<!doctype html>
         wrap.innerHTML = '<div class="empty">暂时没有规则摘要。</div>';
         return;
       }
-      wrap.innerHTML = items.map(item => `
-        <div class="mini-item">
-          <div class="rule-row">
-            <div class="rule-name">${item.title || '-'}</div>
-            <div class="rule-value">${item.value || '-'}</div>
-          </div>
+      wrap.innerHTML = `
+        <div class="rule-summary-list">
+          ${items.map(item => `
+            <div class="mini-item">
+              <div class="rule-row">
+                <div class="rule-name">${item.title || '-'}</div>
+                <div class="rule-value">${item.value || '-'}</div>
+              </div>
+            </div>
+          `).join('')}
         </div>
-      `).join('');
+      `;
     }
 
     function renderConfigToggles(items) {
@@ -1232,7 +1359,7 @@ HTML = """<!doctype html>
         return;
       }
       saveBtn.disabled = false;
-      meta.textContent = `共 ${items.length} 个开关，保存后机器人下个轮询周期自动生效。`;
+      meta.textContent = `共 ${items.length} 项配置，保存后机器人下个轮询周期自动生效。`;
       wrap.innerHTML = `
         <div class="toggle-list">
           ${items.map(item => `
@@ -1241,10 +1368,24 @@ HTML = """<!doctype html>
                 <div class="toggle-name">${item.label || item.key || '-'}</div>
                 <div class="toggle-detail">${item.detail || ''}</div>
               </div>
-              <label class="switch">
-                <input type="checkbox" data-config-key="${item.key}" ${item.enabled ? 'checked' : ''}>
-                <span class="slider"></span>
-              </label>
+              ${item.type === 'number'
+                ? `<div class="config-control">
+                    <input
+                      class="config-number-input"
+                      type="number"
+                      data-config-value-key="${item.key}"
+                      data-config-label="${item.label || item.key || ''}"
+                      min="${item.min ?? 0}"
+                      step="${item.step ?? 1}"
+                      value="${item.value ?? ''}"
+                    >
+                    <span class="config-number-unit">${item.unit || ''}</span>
+                  </div>`
+                : `<label class="switch">
+                    <input type="checkbox" data-config-key="${item.key}" ${item.enabled ? 'checked' : ''}>
+                    <span class="slider"></span>
+                  </label>`
+              }
             </div>
           `).join('')}
         </div>
@@ -1256,16 +1397,26 @@ HTML = """<!doctype html>
       const apiUrl = token ? `/api/config-toggles?token=${encodeURIComponent(token)}` : '/api/config-toggles';
       const btn = document.getElementById('saveToggleBtn');
       const inputs = Array.from(document.querySelectorAll('#configToggleWrap input[data-config-key]'));
-      const toggles = {};
-      for (const input of inputs) {
-        toggles[input.dataset.configKey] = input.checked;
-      }
+      const numberInputs = Array.from(document.querySelectorAll('#configToggleWrap input[data-config-value-key]'));
       btn.disabled = true;
       try {
+        const toggles = {};
+        const values = {};
+        for (const input of inputs) {
+          toggles[input.dataset.configKey] = input.checked;
+        }
+        for (const input of numberInputs) {
+          const raw = String(input.value ?? '').trim();
+          const label = input.dataset.configLabel || input.dataset.configValueKey || '参数';
+          if (!raw) {
+            throw new Error(`${label} 不能为空`);
+          }
+          values[input.dataset.configValueKey] = raw;
+        }
         const res = await fetch(apiUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ toggles }),
+          body: JSON.stringify({ toggles, values }),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
@@ -1414,6 +1565,9 @@ HTML = """<!doctype html>
         const pnlCell = row.isClose && row.realizedPnlUsdt != null
           ? `<td class="${clsByPnl(row.realizedPnlUsdt)}">${fmt(row.realizedPnlUsdt, 4)} USDT</td>`
           : `<td>-</td>`;
+        const pnlPctCell = row.isClose && row.realizedPnlPct != null
+          ? `<td class="${clsByPnl(row.realizedPnlPct)}">${fmt(row.realizedPnlPct, 2)}%</td>`
+          : `<td>-</td>`;
         const reasonCell = row.isClose && row.closeReason
           ? `<td>${translateReason(row.closeReason)}</td>`
           : `<td>-</td>`;
@@ -1427,6 +1581,7 @@ HTML = """<!doctype html>
           <td>${fmt(row.price, 6)}</td>
           <td>${row.quantity || '-'}</td>
           ${pnlCell}
+          ${pnlPctCell}
           ${reasonCell}
           <td>${translateStatus(row.status)}</td>
         </tr>
@@ -1451,6 +1606,7 @@ HTML = """<!doctype html>
                 <th>成交价</th>
                 <th>数量</th>
                 <th>盈亏</th>
+                <th>收益率</th>
                 <th>平仓原因</th>
                 <th>状态</th>
               </tr>
@@ -1641,6 +1797,7 @@ HTML = """<!doctype html>
       const reportPaths = summary.reportPaths || {};
       const tradeAudits = summary.tradeAudits || {};
       const entryAudit = tradeAudits.entryExecution || {};
+      const strategyToggleAudit = tradeAudits.strategyToggleEnforcement || {};
       const exitAudit = tradeAudits.exitExecution || {};
       const pendingExitAudit = tradeAudits.pendingExit || {};
       meta.textContent = healthy
@@ -1679,6 +1836,11 @@ HTML = """<!doctype html>
           title: '开仓审计异常',
           value: `${entryAudit.issueCount || 0} 个`,
           cls: (entryAudit.issueCount || 0) > 0 ? 'bad' : 'good',
+        },
+        {
+          title: '策略开关审计',
+          value: `${strategyToggleAudit.issueCount || 0} 个`,
+          cls: (strategyToggleAudit.issueCount || 0) > 0 ? 'bad' : 'good',
         },
         {
           title: '平仓审计异常',
@@ -1882,6 +2044,40 @@ HTML = """<!doctype html>
         `
         : '<div class="empty">最近没有新的平仓审计样本。</div>';
 
+      const strategyToggleHtml = (strategyToggleAudit.records || []).length
+        ? `
+          <div class="sub" style="margin-top:8px;">已检查 ${strategyToggleAudit.checkedCount || 0} 条，异常 ${strategyToggleAudit.issueCount || 0} 条，缺少开仓审计 ${strategyToggleAudit.missingAuditCount || 0} 条</div>
+          <div class="table-wrap" style="margin-top:12px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>策略</th>
+                  <th>方向</th>
+                  <th>合约</th>
+                  <th>动作</th>
+                  <th>状态</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${(strategyToggleAudit.records || []).map(item => `
+                  <tr>
+                    <td>${item.strategyId || '-'}</td>
+                    <td>${item.side === 'LONG' ? '做多' : (item.side === 'SHORT' ? '做空' : '-')}</td>
+                    <td>${item.asset || '-'}</td>
+                    <td>${translateReason(item.action) || item.action || '-'}</td>
+                    <td class="${item.status === 'error' ? 'bad' : (item.status === 'ok' ? 'good' : '')}">
+                      ${item.status === 'error' ? '异常' : (item.status === 'ok' ? '通过' : '缺审计')}
+                    </td>
+                    <td>${item.details || '-'}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        `
+        : '<div class="empty">当前轮没有可供校验的策略开关审计样本。</div>';
+
       const pendingExitHtml = (pendingExitAudit.records || []).length
         ? `
           <div class="sub" style="margin-top:8px;">当前候选 ${pendingExitAudit.candidateCount || 0} 条，确认异常 ${pendingExitAudit.overdueCount || 0} 条</div>
@@ -1922,6 +2118,7 @@ HTML = """<!doctype html>
         : '<div class="empty">当前没有待执行的平仓候选。</div>';
 
       wrap.innerHTML = `
+        <div class="monitor-report">
         <div class="mini-list">
           ${statItems.map(item => `
             <div class="mini-item">
@@ -1936,6 +2133,8 @@ HTML = """<!doctype html>
         ${artifactHtml}
         <div class="label" style="margin-top:16px;">开仓执行审计</div>
         ${entryAuditHtml}
+        <div class="label" style="margin-top:16px;">策略开关审计</div>
+        ${strategyToggleHtml}
         <div class="label" style="margin-top:16px;">平仓执行审计</div>
         ${exitAuditHtml}
         <div class="label" style="margin-top:16px;">漏执行平仓审计</div>
@@ -1946,6 +2145,7 @@ HTML = """<!doctype html>
         ${incidentHtml}
         <div class="label" style="margin-top:16px;">最近日志异常</div>
         ${logHtml}
+        </div>
       `;
     }
 
@@ -1968,6 +2168,17 @@ HTML = """<!doctype html>
       }
     }
 
+    function setSyncStatus(kind, text) {
+      const panel = document.getElementById('syncStatus');
+      const textNode = document.getElementById('syncStatusText');
+      if (!panel || !textNode) {
+        return;
+      }
+      panel.classList.remove('is-live', 'is-refreshing', 'is-warning');
+      panel.classList.add(kind);
+      textNode.textContent = text;
+    }
+
     async function refresh() {
       try {
         const token = new URLSearchParams(window.location.search).get('token');
@@ -1975,50 +2186,50 @@ HTML = """<!doctype html>
         const res = await fetch(apiUrl);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-      document.getElementById('stamp').textContent = '更新时间: ' + new Date().toLocaleString();
-      const warnBanner = document.getElementById('warnBanner');
-      if (data.dashboardError) {
-        warnBanner.style.display = 'block';
-        warnBanner.textContent =
-          data.dashboardError === 'refreshing'
-            ? '正在后台刷新 Binance 官方数据，当前先显示最近一次成功数据。'
-            : 'Binance 官方接口临时失败，当前显示的是最近一次成功数据。';
-      } else {
-        warnBanner.style.display = 'none';
-        warnBanner.textContent = '';
-      }
+        document.getElementById('stamp').textContent = '更新时间: ' + new Date().toLocaleString();
+        if (data.dashboardError) {
+          setSyncStatus(
+            data.dashboardError === 'refreshing' ? 'is-refreshing' : 'is-warning',
+            data.dashboardError === 'refreshing'
+              ? '正在后台刷新 Binance 官方数据，页面先显示最近一次成功数据。'
+              : 'Binance 官方接口临时失败，当前显示的是最近一次成功数据。'
+          );
+        } else {
+          setSyncStatus('is-live', '数据已同步，页面展示的是最新结果。');
+        }
 
-      document.getElementById('source').textContent = translateSource(data.source);
-      document.getElementById('openPositions').textContent = `${data.summary?.openPositions ?? 0} 个`;
-      document.getElementById('totalPnl').textContent = `${fmt(data.summary?.totalUnrealizedProfit, 4)} USDT`;
-      document.getElementById('totalValue').textContent = `${fmt(data.summary?.totalPositionValueUsdt, 2)} USDT`;
-      document.getElementById('realizedPnl').textContent = `${fmt(data.summary?.realizedPnlUsdt, 4)} USDT`;
+        document.getElementById('source').textContent = translateSource(data.source);
+        document.getElementById('openPositions').textContent = `${data.summary?.openPositions ?? 0} 个`;
+        document.getElementById('totalPnl').textContent = `${fmt(data.summary?.totalUnrealizedProfit, 4)} USDT`;
+        document.getElementById('totalValue').textContent = `${fmt(data.summary?.totalPositionValueUsdt, 2)} USDT`;
+        document.getElementById('realizedPnl').textContent = `${fmt(data.summary?.realizedPnlUsdt, 4)} USDT`;
 
-      const wallet = data.account?.availableBalance && data.account?.totalWalletBalance
-        ? `${fmt(data.account.availableBalance, 2)} / ${fmt(data.account.totalWalletBalance, 2)}`
-        : '-';
-      document.getElementById('wallet').textContent = wallet;
+        const wallet = data.account?.availableBalance && data.account?.totalWalletBalance
+          ? `${fmt(data.account.availableBalance, 2)} / ${fmt(data.account.totalWalletBalance, 2)}`
+          : '-';
+        document.getElementById('wallet').textContent = wallet;
 
-      renderLeverageInfo(data.tradingSetup || {});
-      renderBlockSummary('longSummary', data.sideSummaries?.LONG || { unrealizedProfit: 0, openPositions: 0, currentValueUsdt: 0, realizedPnlUsdt: 0, closedCount: 0 });
-      renderBlockSummary('shortSummary', data.sideSummaries?.SHORT || { unrealizedProfit: 0, openPositions: 0, currentValueUsdt: 0, realizedPnlUsdt: 0, closedCount: 0 });
-      renderOverallSummary(data.summary || {});
-      renderPositions(data.positions || []);
-      renderStrategies(data.strategies || {});
-      renderUnopenedCandidates(data.unopenedCandidates || []);
-      renderCooldowns(data.cooldownSummary || {}, data.activeCooldowns || []);
-      renderBestWorst(data);
-      renderTradeHistory(data.tradeHistory || []);
-      renderForceOrders(data.forceOrderSummary || {});
-      renderRecoveryStats(data.recoveryStats || null);
-      renderMonitorSummary(data.monitorSummary || null);
-      renderRuleSummary(data.ruleSummary || []);
-      renderConfigToggles(data.configToggles || []);
-      renderReadiness(data.productionReadiness || []);
-      renderAccountRiskStats(data.riskStats || null);
+        renderLeverageInfo(data.tradingSetup || {});
+        renderBlockSummary('longSummary', data.sideSummaries?.LONG || { unrealizedProfit: 0, openPositions: 0, currentValueUsdt: 0, realizedPnlUsdt: 0, closedCount: 0 });
+        renderBlockSummary('shortSummary', data.sideSummaries?.SHORT || { unrealizedProfit: 0, openPositions: 0, currentValueUsdt: 0, realizedPnlUsdt: 0, closedCount: 0 });
+        renderOverallSummary(data.summary || {});
+        renderPositions(data.positions || []);
+        renderStrategies(data.strategies || {});
+        renderUnopenedCandidates(data.unopenedCandidates || []);
+        renderCooldowns(data.cooldownSummary || {}, data.activeCooldowns || []);
+        renderBestWorst(data);
+        renderTradeHistory(data.tradeHistory || []);
+        renderForceOrders(data.forceOrderSummary || {});
+        renderRecoveryStats(data.recoveryStats || null);
+        renderMonitorSummary(data.monitorSummary || null);
+        renderRuleSummary(data.ruleSummary || []);
+        renderConfigToggles(data.configToggles || []);
+        renderReadiness(data.productionReadiness || []);
+        renderAccountRiskStats(data.riskStats || null);
       } catch (err) {
         console.error('refresh failed:', err);
         document.getElementById('stamp').textContent = '数据加载失败: ' + (err.message || err) + '，10 秒后重试...';
+        setSyncStatus('is-warning', '当前请求失败，页面将在 10 秒后自动重试。');
       }
     }
 
@@ -2041,8 +2252,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
     refresh_in_progress = False
     refresh_lock = threading.Lock()
     cache_ttl_seconds = int(os.getenv("DASHBOARD_CACHE_TTL_SECONDS", "10"))
-    reset_cooldown_remaining_seconds = 10 * 60
-
     @classmethod
     def _access_token(cls) -> str:
         return os.getenv("DASHBOARD_ACCESS_TOKEN", "").strip()
@@ -2096,12 +2305,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         cls.last_error = None
 
     @classmethod
-    def _update_config_toggles(cls, toggles: dict[str, bool]) -> dict[str, str]:
+    def _normalize_config_values(cls, raw_values: dict[str, object]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for key, raw_value in raw_values.items():
+            if key not in CONFIG_VALUE_KEYS:
+                continue
+            if key == "COOLDOWN_MINUTES":
+                try:
+                    minutes = int(str(raw_value).strip())
+                except Exception as exc:
+                    raise ValueError("冷却时间必须填写整数分钟") from exc
+                if minutes < 0 or minutes > 10080:
+                    raise ValueError("冷却时间必须是 0 到 10080 之间的整数分钟")
+                normalized[key] = str(minutes)
+        return normalized
+
+    @classmethod
+    def _update_config_settings(
+        cls,
+        toggles: dict[str, bool],
+        values: dict[str, str],
+    ) -> dict[str, str]:
         updates = {
             key: ("true" if bool(value) else "false")
             for key, value in toggles.items()
             if key in CONFIG_TOGGLE_KEYS
         }
+        updates.update({key: value for key, value in values.items() if key in CONFIG_VALUE_KEYS})
         if not updates:
             return {}
         path = cls._dotenv_path()
@@ -2135,10 +2365,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = cls._state_path()
         if not path.exists():
             return 0
+        load_dotenv(cls._dotenv_path())
+        config = build_config(cls.workdir)
         state = json.loads(path.read_text(encoding="utf-8-sig"))
         history = state.get("history", [])
         updated = 0
-        reset_cooldown_until = time.time() + cls.reset_cooldown_remaining_seconds
+        reset_cooldown_until = time.time() + max(0, int(config.cooldown_minutes)) * 60
         for event in history:
             if event.get("action") not in {"exit_long", "exit_short"}:
                 continue
@@ -2148,6 +2380,207 @@ class DashboardHandler(BaseHTTPRequestHandler):
         cls._invalidate_cache()
         cls._ensure_refresh()
         return updated
+
+    @classmethod
+    def _runtime_dir(cls) -> Path:
+        return cls.workdir / "runtime"
+
+    @classmethod
+    def _reset_marker_path(cls) -> Path:
+        return cls._runtime_dir() / "reset_marker.json"
+
+    @classmethod
+    def _write_json_file(cls, path: Path, payload: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def _truncate_text_file(cls, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    @classmethod
+    def _stop_service_if_available(cls, service_name: str) -> dict[str, object]:
+        if os.name == "nt":
+            return {"service": service_name, "attempted": False, "stopped": False}
+        systemctl = shutil.which("systemctl")
+        if not systemctl:
+            return {"service": service_name, "attempted": False, "stopped": False}
+        try:
+            subprocess.run(
+                [systemctl, "stop", service_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return {"service": service_name, "attempted": True, "stopped": True}
+        except Exception as exc:
+            return {
+                "service": service_name,
+                "attempted": True,
+                "stopped": False,
+                "error": str(exc),
+            }
+
+    @classmethod
+    def _stop_runtime_services_if_available(cls) -> list[dict[str, object]]:
+        return [
+            cls._stop_service_if_available("ai-select-bot.service"),
+            cls._stop_service_if_available("ai-select-monitor.service"),
+        ]
+
+    @classmethod
+    def _reset_exchange_state(cls) -> dict[str, object]:
+        load_dotenv(cls._dotenv_path())
+        broker = select_broker_adapter()
+        summary: dict[str, object] = {
+            "broker": getattr(broker, "name", "unknown"),
+            "officialResetApi": False,
+            "cancelledOrderSymbols": 0,
+            "cancelFailures": [],
+            "closedPositions": 0,
+            "closeFailures": [],
+        }
+        if getattr(broker, "name", "") != "binance_testnet":
+            summary["ok"] = True
+            summary["note"] = "当前不是 Binance Testnet，未执行交易所侧重置。"
+            return summary
+
+        open_orders: list[dict[str, object]] = []
+        if hasattr(broker, "_signed_request"):
+            try:
+                payload = broker._signed_request("GET", "/fapi/v1/openOrders", {})
+                if isinstance(payload, list):
+                    open_orders = payload
+            except Exception as exc:
+                summary["openOrderQueryError"] = str(exc)
+
+        symbols_with_orders = sorted(
+            {
+                str(item.get("symbol"))
+                for item in open_orders
+                if isinstance(item, dict) and item.get("symbol")
+            }
+        )
+        cancel_failures: list[dict[str, object]] = []
+        for symbol in symbols_with_orders:
+            try:
+                broker._signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+            except Exception as exc:
+                cancel_failures.append({"symbol": symbol, "error": str(exc)})
+        summary["cancelledOrderSymbols"] = len(symbols_with_orders) - len(cancel_failures)
+        summary["cancelFailures"] = cancel_failures
+
+        snapshot = broker.get_account_snapshot() or {}
+        live_positions = snapshot.get("positions") or []
+        close_failures: list[dict[str, object]] = []
+        closed_positions = 0
+        for item in live_positions:
+            if not isinstance(item, dict):
+                continue
+            contract_symbol = str(item.get("symbol") or "")
+            side = live_side_from_amount(item.get("positionAmt", "0"))
+            if not contract_symbol or side is None:
+                continue
+            asset = contract_symbol[:-4] if contract_symbol.endswith("USDT") else contract_symbol
+            try:
+                result = broker.close_position(
+                    contract_symbol=contract_symbol,
+                    asset=asset,
+                    side=side,
+                    position={},
+                    dry_run=False,
+                )
+                if result.get("confirmedClosed") is False or result.get("status") == "CLOSE_REJECTED":
+                    close_failures.append(
+                        {
+                            "symbol": contract_symbol,
+                            "side": side,
+                            "error": result.get("error") or result.get("status") or "close_failed",
+                        }
+                    )
+                else:
+                    closed_positions += 1
+            except Exception as exc:
+                close_failures.append({"symbol": contract_symbol, "side": side, "error": str(exc)})
+
+        summary["closedPositions"] = closed_positions
+        summary["closeFailures"] = close_failures
+        summary["ok"] = not cancel_failures and not close_failures
+        return summary
+
+    @classmethod
+    def _reset_local_runtime_state(cls) -> dict[str, object]:
+        load_dotenv(cls._dotenv_path())
+        config = build_config(cls.workdir)
+        runtime_dir = cls._runtime_dir()
+        reset_at_ms = int(time.time() * 1000)
+        reset_at = reset_at_ms / 1000
+
+        json_files: dict[Path, object] = {
+            config.state_file: {"positions": {}, "history": []},
+            config.strategy_status_file: {},
+            config.positive_snapshot_file: [],
+            config.negative_snapshot_file: [],
+            runtime_dir / "history_cache.json": {},
+            runtime_dir / "account_equity_history.json": [],
+            runtime_dir / "monitor_state.json": {},
+            cls._reset_marker_path(): {
+                "resetAt": reset_at,
+                "resetAtMs": reset_at_ms,
+                "source": "dashboard_reset_all",
+            },
+        }
+        removed_files = [
+            runtime_dir / "dashboard_cache.json",
+            runtime_dir / "monitor_summary.json",
+            runtime_dir / "monitor_report.json",
+            runtime_dir / "monitor_report.md",
+        ]
+        truncated_files = [
+            config.log_file,
+            runtime_dir / "monitor.log",
+            runtime_dir / "monitor_events.jsonl",
+        ]
+
+        touched: list[str] = []
+        for path, payload in json_files.items():
+            cls._write_json_file(path, payload)
+            touched.append(str(path))
+        for path in truncated_files:
+            cls._truncate_text_file(path)
+            touched.append(str(path))
+        for path in removed_files:
+            if path.exists():
+                path.unlink()
+                touched.append(str(path))
+
+        cls._invalidate_cache()
+        cls._ensure_refresh()
+        return {
+            "resetAtMs": reset_at_ms,
+            "touchedFiles": touched,
+            "touchedCount": len(touched),
+        }
+
+    @classmethod
+    def _reset_all_data(cls) -> dict[str, object]:
+        service_results = cls._stop_runtime_services_if_available()
+        exchange_summary = cls._reset_exchange_state()
+        if not bool(exchange_summary.get("ok", True)):
+            raise RuntimeError(
+                "交易所侧重置没有完成，请先检查撤单/平仓结果后再清空本地数据。"
+            )
+        local_summary = cls._reset_local_runtime_state()
+        return {
+            "services": service_results,
+            "exchange": exchange_summary,
+            "local": local_summary,
+        }
 
     @classmethod
     def _refresh_report(cls) -> None:
@@ -2288,15 +2721,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 content_length = int(self.headers.get("Content-Length", "0") or "0")
                 body = self.rfile.read(content_length) if content_length > 0 else b"{}"
                 payload = json.loads(body.decode("utf-8") or "{}")
-                raw_toggles = payload.get("toggles")
+                raw_toggles = payload.get("toggles", {})
+                raw_values = payload.get("values", {})
                 if not isinstance(raw_toggles, dict):
                     raise ValueError("Invalid toggles payload")
+                if not isinstance(raw_values, dict):
+                    raise ValueError("Invalid values payload")
                 normalized = {
                     key: bool(value)
                     for key, value in raw_toggles.items()
                     if key in CONFIG_TOGGLE_KEYS
                 }
-                updated = self.__class__._update_config_toggles(normalized)
+                normalized_values = self.__class__._normalize_config_values(raw_values)
+                updated = self.__class__._update_config_settings(normalized, normalized_values)
                 self._send(
                     json.dumps({"ok": True, "updated": updated}, ensure_ascii=False).encode("utf-8"),
                     content_type="application/json; charset=utf-8",
@@ -2313,6 +2750,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 reset_count = self.__class__._reset_cooldowns()
                 self._send(
                     json.dumps({"ok": True, "resetCount": reset_count}, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json; charset=utf-8",
+                )
+            except Exception as exc:
+                self._send(
+                    json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json; charset=utf-8",
+                    status=500,
+                )
+            return
+        if parsed.path == "/api/reset-all-data":
+            try:
+                summary = self.__class__._reset_all_data()
+                self._send(
+                    json.dumps({"ok": True, "summary": summary}, ensure_ascii=False).encode("utf-8"),
                     content_type="application/json; charset=utf-8",
                 )
             except Exception as exc:

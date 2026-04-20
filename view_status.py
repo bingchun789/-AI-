@@ -33,6 +33,17 @@ def _load_json(path: Path, default: Any) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def _local_state_positions_by_symbol_side(state: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for position in state.get("positions", {}).values():
+        symbol = position.get("contractSymbol")
+        side = position.get("side")
+        if not symbol or side not in {LONG, SHORT}:
+            continue
+        rows[(symbol, side)] = position
+    return rows
+
+
 def _build_local_positions(state: dict[str, Any], broker: Any) -> list[dict[str, Any]]:
     contract_symbols = [
         pos.get("contractSymbol")
@@ -161,6 +172,12 @@ def _build_rule_summary(config: Any) -> list[dict[str, str]]:
             else "已关闭",
         },
         {
+            "title": "硬止损",
+            "value": f"开仓后立即挂 {config.stop_loss_pct:.0f}% 止损单"
+            if config.enable_stop_loss
+            else "已关闭",
+        },
+        {
             "title": "利润保护",
             "value": f"收益达到 {activate_pct:.0f}% 后启动，保留峰值收益的 {100 - trail_pct:.0f}%，相对峰值回撤 {trail_pct:.0f}% 平仓"
             if config.enable_profit_protection
@@ -187,6 +204,16 @@ def _build_config_toggles(config: Any) -> list[dict[str, Any]]:
             "label": "模拟下单",
             "enabled": config.dry_run,
             "detail": "开启后只记录信号和结果，不向交易所提交真实订单。",
+        },
+        {
+            "key": "COOLDOWN_MINUTES",
+            "label": "冷却时间",
+            "type": "number",
+            "value": int(config.cooldown_minutes),
+            "min": 0,
+            "step": 1,
+            "unit": "分钟",
+            "detail": "平仓后按这里填写的分钟数，限制同方向再次开仓。",
         },
         {
             "key": "ENABLE_MARGIN_USAGE_CAP",
@@ -235,6 +262,12 @@ def _build_config_toggles(config: Any) -> list[dict[str, Any]]:
                 f"持仓超过 {config.max_hold_hours} 小时且收益不高于 "
                 f"{config.time_exit_min_pnl_pct}% 时平仓。"
             ),
+        },
+        {
+            "key": "ENABLE_STOP_LOSS",
+            "label": "硬止损",
+            "enabled": config.enable_stop_loss,
+            "detail": f"开仓后立即挂 {config.stop_loss_pct}% 硬止损单。",
         },
         {
             "key": "ENABLE_PROFIT_LOCK",
@@ -900,6 +933,30 @@ def _build_trade_history_from_close_events(
             order_type = "强制平仓"
         elif reason == "adl":
             order_type = "自动减仓(ADL)"
+        realized_pnl = (
+            event.get("netRealizedPnlUsdt")
+            if event.get("netRealizedPnlUsdt") not in (None, "")
+            else event.get("realizedPnlUsdt")
+        )
+        realized_pnl_pct = None
+        if realized_pnl not in (None, ""):
+            basis = None
+            for key in ("returnBasisUsdt", "entryNotionalUsdt"):
+                raw_value = event.get(key)
+                if raw_value in (None, "", 0, "0"):
+                    continue
+                try:
+                    candidate_basis = abs(Decimal(str(raw_value)))
+                except Exception:
+                    continue
+                if candidate_basis != Decimal("0"):
+                    basis = candidate_basis
+                    break
+            if basis not in (None, Decimal("0")):
+                try:
+                    realized_pnl_pct = str((Decimal(str(realized_pnl)) / basis) * Decimal("100"))
+                except Exception:
+                    realized_pnl_pct = None
         items.append(
             {
                 "timestamp": event.get("timestamp"),
@@ -916,11 +973,8 @@ def _build_trade_history_from_close_events(
                 "orderId": str(event.get("orderId", "")),
                 "isClose": True,
                 "closeReason": event.get("reason"),
-                "realizedPnlUsdt": (
-                    event.get("netRealizedPnlUsdt")
-                    if event.get("netRealizedPnlUsdt") not in (None, "")
-                    else event.get("realizedPnlUsdt")
-                ),
+                "realizedPnlUsdt": realized_pnl,
+                "realizedPnlPct": realized_pnl_pct,
             }
         )
     return items
@@ -1714,6 +1768,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         for key, value in all_strategy_statuses.items()
         if key in {LONG_STRATEGY_ID, SHORT_STRATEGY_ID}
     }
+    local_positions_by_key = _local_state_positions_by_symbol_side(state)
 
     closed_history = [
         event
@@ -1732,6 +1787,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             side = live_side_from_amount(item.get("positionAmt", "0"))
             if not side:
                 continue
+            local_position = local_positions_by_key.get((item.get("symbol"), side), {})
             quantity = abs(Decimal(str(item.get("positionAmt", "0"))))
             entry_price = Decimal(str(item.get("entryPrice", "0")))
             mark_price = Decimal(str(item.get("markPrice", "0")))
@@ -1767,7 +1823,9 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
                     "marginMode": _normalize_margin_mode(item.get("marginType"))
                     or ("ISOLATED" if item.get("isolated") else None),
                     "status": "LIVE_TESTNET",
-                    "openedAt": None,
+                    "openedAt": local_position.get("openedAt"),
+                    "stopLossPrice": local_position.get("stopLossPrice"),
+                    "stopLossStatus": local_position.get("stopLossStatus"),
                 }
             )
         long_positions = [row for row in positions if row.get("side") == LONG]
