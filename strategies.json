@@ -1,0 +1,22 @@
+{
+  "strategies": [
+    {
+      "id": "ai_select_futures_long",
+      "name": "AI 精选做多",
+      "enabled": true,
+      "category": "sentiment",
+      "priority": 1,
+      "min_balance_usdt": 0,
+      "description": "抓取 Binance AI 精选里的强烈看多列表，存在 USDT 永续合约则做多。"
+    },
+    {
+      "id": "ai_select_futures_short",
+      "name": "AI 精选做空",
+      "enabled": true,
+      "category": "sentiment",
+      "priority": 2,
+      "min_balance_usdt": 0,
+      "description": "抓取 Binance AI 精选里的强烈看空列表，存在 USDT 永续合约则做空。"
+    }
+  ]
+}
