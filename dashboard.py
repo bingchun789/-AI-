@@ -60,6 +60,11 @@ CONFIG_INTEGER_VALUE_KEYS = {
     "MAX_CORRELATED_POSITIONS_PER_SIDE",
 }
 
+RUNTIME_CONTROL_SERVICES = (
+    "ai-select-bot.service",
+    "ai-select-monitor.service",
+)
+
 
 HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -615,6 +620,37 @@ HTML = """<!doctype html>
     .action-btn:hover:not(:disabled) {
       transform: translateY(-1px);
     }
+    .action-btn.danger {
+      background: linear-gradient(135deg, #8f241d, #c44d3f);
+    }
+    .action-btn.safe {
+      background: linear-gradient(135deg, #0c7a43, #1a9c61);
+    }
+    .control-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, .72fr);
+      gap: 14px;
+      align-items: stretch;
+    }
+    .control-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .control-note {
+      padding: 14px;
+      border-radius: 18px;
+      border: 1px solid rgba(180,35,24,.18);
+      background: rgba(255,245,241,.72);
+      color: var(--text);
+      line-height: 1.65;
+      font-size: 13px;
+    }
+    .control-status {
+      display: grid;
+      gap: 10px;
+    }
     .filter-btn {
       background: rgba(255,255,255,.82);
       color: var(--muted);
@@ -726,6 +762,7 @@ HTML = """<!doctype html>
       .grid, .triple, .highlights, .panels { grid-template-columns: 1fr; }
       .hero { grid-template-columns: 1fr; }
       .dashboard-grid { grid-template-columns: 1fr; }
+      .control-grid { grid-template-columns: 1fr; }
       .rule-summary-list { grid-template-columns: 1fr; }
       .col-2, .col-3, .col-4, .col-5, .col-6, .col-7, .col-8, .col-12 { grid-column: span 1; }
       .strategy-grid { grid-template-columns: 1fr; }
@@ -928,6 +965,25 @@ HTML = """<!doctype html>
 
       <section class="tab-panel" data-panel="settings" role="tabpanel">
         <div class="section-stack settings-stack">
+          <div class="card card-table">
+            <div class="control-grid">
+              <div>
+                <div class="label">重置与启停</div>
+                <div class="sub">推荐流程：先停止交易服务，在币安后台手动重置模拟盘，再重置本地数据，最后启动交易服务。</div>
+                <div class="control-actions">
+                  <button class="action-btn danger" id="stopServicesBtn" onclick="runtimeControl('stop')">停止交易服务</button>
+                  <button class="action-btn danger" id="resetLocalDataBtn" onclick="resetLocalData()">重置本地数据</button>
+                  <button class="action-btn safe" id="startServicesBtn" onclick="runtimeControl('start')">启动交易服务</button>
+                </div>
+              </div>
+              <div>
+                <div class="control-note">
+                  “重置本地数据”只清空本地持仓、历史、冷却、熔断、归因和缓存，不会自动撤单或平仓。币安后台的数据请你手动确认已经重置完成。
+                </div>
+                <div class="mini-list control-status" id="runtimeControlStatus" style="margin-top:10px;"></div>
+              </div>
+            </div>
+          </div>
           <div class="card card-table">
             <div class="action-row">
               <div>
@@ -1427,9 +1483,99 @@ HTML = """<!doctype html>
       `;
     }
 
-    async function saveConfigToggles() {
+    function apiUrl(path) {
       const token = new URLSearchParams(window.location.search).get('token');
-      const apiUrl = token ? `/api/config-toggles?token=${encodeURIComponent(token)}` : '/api/config-toggles';
+      return token ? `${path}?token=${encodeURIComponent(token)}` : path;
+    }
+
+    function serviceNameLabel(name) {
+      if (name === 'ai-select-bot.service') return '交易机器人';
+      if (name === 'ai-select-monitor.service') return '巡检服务';
+      return name || '-';
+    }
+
+    function renderRuntimeControl(state) {
+      const wrap = document.getElementById('runtimeControlStatus');
+      const stopBtn = document.getElementById('stopServicesBtn');
+      const startBtn = document.getElementById('startServicesBtn');
+      const resetBtn = document.getElementById('resetLocalDataBtn');
+      if (!wrap || !stopBtn || !startBtn || !resetBtn) return;
+      const services = Array.isArray(state?.services) ? state.services : [];
+      const canManage = state?.canManage !== false;
+      const activeCount = services.filter(item => item.active).length;
+      stopBtn.disabled = !canManage || (services.length > 0 && activeCount === 0);
+      startBtn.disabled = !canManage || (services.length > 0 && activeCount === services.length);
+      resetBtn.disabled = !canManage;
+      if (!services.length) {
+        wrap.innerHTML = '<div class="mini-item"><div class="mini-title">服务状态</div><div>暂时无法读取 systemd 状态。</div></div>';
+        return;
+      }
+      wrap.innerHTML = services.map(item => `
+        <div class="mini-item">
+          <div class="rule-row">
+            <div class="rule-name">${serviceNameLabel(item.service)}</div>
+            <div class="rule-value ${item.active ? 'good' : 'bad'}">${item.active ? '运行中' : '已停止'}</div>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    async function postJson(path, payload = {}) {
+      const res = await fetch(apiUrl(path), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || '操作失败');
+      }
+      return data;
+    }
+
+    function setRuntimeButtonsDisabled(disabled) {
+      ['stopServicesBtn', 'resetLocalDataBtn', 'startServicesBtn'].forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.disabled = disabled;
+      });
+    }
+
+    async function runtimeControl(action) {
+      const isStop = action === 'stop';
+      const message = isStop
+        ? '确认停止交易机器人和巡检服务？停止后系统不会继续自动开仓/平仓管理，请确认你准备去币安后台重置。'
+        : '确认启动交易机器人和巡检服务？请先确认币安后台已经重置完成，并且本地数据已经清空。';
+      if (!confirm(message)) return;
+      setRuntimeButtonsDisabled(true);
+      let refreshed = false;
+      try {
+        await postJson('/api/runtime-control', { action });
+        await refresh();
+        refreshed = true;
+      } catch (err) {
+        alert(`操作失败: ${err.message || err}`);
+      } finally {
+        if (!refreshed) setRuntimeButtonsDisabled(false);
+      }
+    }
+
+    async function resetLocalData() {
+      const message = '确认重置本地数据？这会清空本地持仓、历史、冷却、熔断、归因、缓存和日志，但不会操作币安后台。建议先停止交易服务，并确认币安后台已手动重置。';
+      if (!confirm(message)) return;
+      setRuntimeButtonsDisabled(true);
+      let refreshed = false;
+      try {
+        await postJson('/api/reset-local-data', {});
+        await refresh();
+        refreshed = true;
+      } catch (err) {
+        alert(`重置失败: ${err.message || err}`);
+      } finally {
+        if (!refreshed) setRuntimeButtonsDisabled(false);
+      }
+    }
+
+    async function saveConfigToggles() {
       const btn = document.getElementById('saveToggleBtn');
       const inputs = Array.from(document.querySelectorAll('#configToggleWrap input[data-config-key]'));
       const numberInputs = Array.from(document.querySelectorAll('#configToggleWrap input[data-config-value-key]'));
@@ -1448,7 +1594,7 @@ HTML = """<!doctype html>
           }
           values[input.dataset.configValueKey] = raw;
         }
-        const res = await fetch(apiUrl, {
+        const res = await fetch(apiUrl('/api/config-toggles'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ toggles, values }),
@@ -2375,6 +2521,7 @@ HTML = """<!doctype html>
         renderMonitorSummary(data.monitorSummary || null);
         renderRuleSummary(data.ruleSummary || []);
         renderConfigToggles(data.configToggles || []);
+        renderRuntimeControl(data.runtimeControl || {});
         renderReadiness(data.productionReadiness || []);
         renderAccountRiskStats(data.riskStats || null);
         renderCircuitBreaker(data.accountCircuitBreaker || {});
@@ -2577,35 +2724,118 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path.write_text("", encoding="utf-8")
 
     @classmethod
-    def _stop_service_if_available(cls, service_name: str) -> dict[str, object]:
+    def _systemctl_path(cls) -> str | None:
         if os.name == "nt":
-            return {"service": service_name, "attempted": False, "stopped": False}
-        systemctl = shutil.which("systemctl")
+            return None
+        return shutil.which("systemctl")
+
+    @classmethod
+    def _service_status(cls, service_name: str) -> dict[str, object]:
+        systemctl = cls._systemctl_path()
         if not systemctl:
-            return {"service": service_name, "attempted": False, "stopped": False}
+            return {
+                "service": service_name,
+                "active": False,
+                "available": False,
+                "status": "unavailable",
+            }
+        try:
+            result = subprocess.run(
+                [systemctl, "is-active", service_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            status = (result.stdout or result.stderr or "unknown").strip()
+            return {
+                "service": service_name,
+                "active": status == "active",
+                "available": True,
+                "status": status,
+            }
+        except Exception as exc:
+            return {
+                "service": service_name,
+                "active": False,
+                "available": False,
+                "status": "error",
+                "error": str(exc),
+            }
+
+    @classmethod
+    def _runtime_control_state(cls) -> dict[str, object]:
+        systemctl = cls._systemctl_path()
+        services = [cls._service_status(name) for name in RUNTIME_CONTROL_SERVICES]
+        return {
+            "canManage": bool(systemctl),
+            "services": services,
+            "updatedAt": time.time(),
+        }
+
+    @classmethod
+    def _manage_service_if_available(cls, service_name: str, action: str) -> dict[str, object]:
+        if action not in {"start", "stop", "restart"}:
+            raise ValueError("Unsupported runtime action")
+        systemctl = cls._systemctl_path()
+        if not systemctl:
+            return {
+                "service": service_name,
+                "action": action,
+                "attempted": False,
+                "ok": False,
+                "error": "systemctl unavailable",
+            }
         try:
             subprocess.run(
-                [systemctl, "stop", service_name],
+                [systemctl, action, service_name],
                 check=True,
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
-            return {"service": service_name, "attempted": True, "stopped": True}
+            status = cls._service_status(service_name)
+            return {
+                "service": service_name,
+                "action": action,
+                "attempted": True,
+                "ok": True,
+                "active": status.get("active"),
+                "status": status.get("status"),
+            }
         except Exception as exc:
             return {
                 "service": service_name,
+                "action": action,
                 "attempted": True,
-                "stopped": False,
+                "ok": False,
                 "error": str(exc),
             }
 
     @classmethod
+    def _stop_service_if_available(cls, service_name: str) -> dict[str, object]:
+        result = cls._manage_service_if_available(service_name, "stop")
+        result["stopped"] = bool(result.get("ok"))
+        return result
+
+    @classmethod
+    def _manage_runtime_services(cls, action: str) -> dict[str, object]:
+        services = list(RUNTIME_CONTROL_SERVICES)
+        if action == "start":
+            services = list(reversed(services))
+        results = [cls._manage_service_if_available(service, action) for service in services]
+        time.sleep(0.5)
+        cls._invalidate_cache()
+        cls._ensure_refresh()
+        return {
+            "action": action,
+            "results": results,
+            "state": cls._runtime_control_state(),
+        }
+
+    @classmethod
     def _stop_runtime_services_if_available(cls) -> list[dict[str, object]]:
-        return [
-            cls._stop_service_if_available("ai-select-bot.service"),
-            cls._stop_service_if_available("ai-select-monitor.service"),
-        ]
+        return [cls._stop_service_if_available(service) for service in RUNTIME_CONTROL_SERVICES]
 
     @classmethod
     def _reset_exchange_state(cls) -> dict[str, object]:
@@ -2744,15 +2974,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     @classmethod
     def _reset_all_data(cls) -> dict[str, object]:
         service_results = cls._stop_runtime_services_if_available()
-        exchange_summary = cls._reset_exchange_state()
-        if not bool(exchange_summary.get("ok", True)):
-            raise RuntimeError(
-                "交易所侧重置没有完成，请先检查撤单/平仓结果后再清空本地数据。"
-            )
         local_summary = cls._reset_local_runtime_state()
         return {
             "services": service_results,
-            "exchange": exchange_summary,
+            "exchange": {
+                "manualRequired": True,
+                "note": "网页不会自动撤单或平仓，请在币安后台手动完成重置。",
+            },
             "local": local_summary,
         }
 
@@ -2873,6 +3101,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "dashboardError": cls.last_error or "refreshing",
                     }
 
+            payload["runtimeControl"] = cls._runtime_control_state()
             self._send(
                 json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 content_type="application/json; charset=utf-8",
@@ -2924,6 +3153,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 reset_count = self.__class__._reset_cooldowns()
                 self._send(
                     json.dumps({"ok": True, "resetCount": reset_count}, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json; charset=utf-8",
+                )
+            except Exception as exc:
+                self._send(
+                    json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json; charset=utf-8",
+                    status=500,
+                )
+            return
+        if parsed.path == "/api/runtime-control":
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+                body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+                payload = json.loads(body.decode("utf-8") or "{}")
+                action = str(payload.get("action") or "").strip().lower()
+                if action not in {"start", "stop"}:
+                    raise ValueError("action 只能是 start 或 stop")
+                summary = self.__class__._manage_runtime_services(action)
+                self._send(
+                    json.dumps({"ok": True, "summary": summary}, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json; charset=utf-8",
+                )
+            except Exception as exc:
+                self._send(
+                    json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json; charset=utf-8",
+                    status=500,
+                )
+            return
+        if parsed.path == "/api/reset-local-data":
+            try:
+                state = self.__class__._runtime_control_state()
+                active_services = [
+                    item.get("service")
+                    for item in state.get("services", [])
+                    if item.get("active")
+                ]
+                if state.get("canManage") and active_services:
+                    raise RuntimeError("请先停止交易服务，再重置本地数据。")
+                summary = self.__class__._reset_local_runtime_state()
+                self._send(
+                    json.dumps({"ok": True, "summary": summary}, ensure_ascii=False).encode("utf-8"),
                     content_type="application/json; charset=utf-8",
                 )
             except Exception as exc:
