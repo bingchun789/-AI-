@@ -28,10 +28,36 @@ CONFIG_TOGGLE_KEYS = {
     "ENABLE_PROFIT_PROTECTION",
     "ENABLE_SIGNAL_DROP_GUARD",
     "SKIP_IF_MARGIN_MODE_UNAVAILABLE",
+    "ENABLE_ACCOUNT_CIRCUIT_BREAKER",
+    "ENABLE_RISK_POSITION_SIZING",
+    "ENABLE_PORTFOLIO_RISK_CAP",
+    "ENABLE_BREAKEVEN_STOP",
+    "ENABLE_PARTIAL_TAKE_PROFIT",
 }
 
 CONFIG_VALUE_KEYS = {
     "COOLDOWN_MINUTES",
+    "DAILY_LOSS_PAUSE_PCT",
+    "MAX_CONSECUTIVE_LOSSES",
+    "MAX_ACCOUNT_DRAWDOWN_PCT",
+    "CIRCUIT_BREAKER_COOLDOWN_MINUTES",
+    "RISK_PER_TRADE_PCT",
+    "MIN_NOTIONAL_PER_TRADE_USDT",
+    "MAX_NOTIONAL_PER_TRADE_USDT",
+    "MAX_SIDE_OPEN_RISK_PCT",
+    "MAX_TOTAL_OPEN_RISK_PCT",
+    "MAX_CORRELATED_POSITIONS_PER_SIDE",
+    "BREAKEVEN_TRIGGER_PCT",
+    "BREAKEVEN_BUFFER_PCT",
+    "PARTIAL_TAKE_PROFIT_TRIGGER_PCT",
+    "PARTIAL_TAKE_PROFIT_CLOSE_RATIO",
+}
+
+CONFIG_INTEGER_VALUE_KEYS = {
+    "COOLDOWN_MINUTES",
+    "MAX_CONSECUTIVE_LOSSES",
+    "CIRCUIT_BREAKER_COOLDOWN_MINUTES",
+    "MAX_CORRELATED_POSITIONS_PER_SIDE",
 }
 
 
@@ -878,6 +904,8 @@ HTML = """<!doctype html>
       <section class="tab-panel" data-panel="risk" role="tabpanel">
         <div class="panels">
           <div class="card"><div class="label">风险统计</div><div class="mini-list" id="riskStatsWrap"></div></div>
+          <div class="card"><div class="label">账户熔断状态</div><div class="mini-list" id="circuitBreakerWrap"></div></div>
+          <div class="card card-table col-12"><div class="label">策略归因分析</div><div id="attributionWrap"></div></div>
           <div class="card tip-card">
             <div class="label">口径说明</div>
             <div class="mini-list">
@@ -1007,6 +1035,13 @@ HTML = """<!doctype html>
         force_order: '交易所强制平仓',
         exchange_trade: '交易所成交'
       };
+      Object.assign(map, {
+        correlated_cluster_limit: '同向高相关仓位过多',
+        account_circuit_breaker: '账户熔断暂停开仓',
+        side_risk_limit: '单边风险达到上限',
+        portfolio_risk_limit: '组合总风险达到上限',
+        partial_take_profit: '分批止盈'
+      });
       return map[value] || value || '-';
     }
 
@@ -1472,6 +1507,12 @@ HTML = """<!doctype html>
         { title: '平均亏损', value: `${fmt(stats.avgLossUsdtAbs, 4)} USDT` },
         { title: '当前浮动盈亏', value: `${fmt(stats.currentUnrealizedPnlUsdt, 4)} USDT`, cls: clsByPnl(stats.currentUnrealizedPnlUsdt) }
       ];
+      items.push(
+        { title: '当前开仓风险', value: `${fmt(stats.openRiskUsdt, 4)} USDT`, cls: Number(stats.openRiskUsdt || 0) > 0 ? 'warn-text' : '' },
+        { title: '当前开仓风险率', value: stats.openRiskPct != null ? `${fmt(stats.openRiskPct, 2)}%` : '-' },
+        { title: '做多开仓风险', value: `${fmt(stats.openLongRiskUsdt, 4)} USDT` },
+        { title: '做空开仓风险', value: `${fmt(stats.openShortRiskUsdt, 4)} USDT` }
+      );
       wrap.innerHTML = items.map(item => `
         <div class="mini-item">
           <div class="rule-row">
@@ -1480,6 +1521,116 @@ HTML = """<!doctype html>
           </div>
         </div>
       `).join('');
+    }
+
+    function circuitReasonLabel(reason) {
+      const map = {
+        daily_loss: '当日亏损超过阈值',
+        consecutive_losses: '连续亏损达到上限',
+        account_drawdown: '账户回撤超过阈值'
+      };
+      return map[reason] || reason || '-';
+    }
+
+    function renderCircuitBreaker(item) {
+      const wrap = document.getElementById('circuitBreakerWrap');
+      if (!wrap) return;
+      if (!item || item.enabled === false) {
+        wrap.innerHTML = '<div class="mini-item"><div class="mini-title">未启用</div><div>账户级熔断当前关闭。</div></div>';
+        return;
+      }
+      const active = Boolean(item.active);
+      const reasons = Array.isArray(item.reasons) && item.reasons.length
+        ? item.reasons.map(circuitReasonLabel).join('、')
+        : '暂无触发原因';
+      const until = item.until ? fmtCloseTime(Number(item.until) * 1000) : '-';
+      const updatedAt = item.updatedAt ? fmtCloseTime(Number(item.updatedAt) * 1000) : '-';
+      const statusText = active ? '已触发，暂停新开仓' : '正常，允许按策略开仓';
+      wrap.innerHTML = `
+        <div class="mini-item">
+          <div class="rule-row">
+            <div class="rule-name">状态</div>
+            <div class="rule-value ${active ? 'bad' : 'good'}">${statusText}</div>
+          </div>
+        </div>
+        <div class="mini-item">
+          <div class="rule-row"><div class="rule-name">触发原因</div><div class="rule-value">${reasons}</div></div>
+        </div>
+        <div class="mini-item">
+          <div class="rule-row"><div class="rule-name">暂停到</div><div class="rule-value">${until}</div></div>
+        </div>
+        <div class="mini-item">
+          <div class="rule-row"><div class="rule-name">当日亏损率</div><div class="rule-value">${item.dailyLossPct != null ? fmt(item.dailyLossPct, 2) + '%' : '-'}</div></div>
+        </div>
+        <div class="mini-item">
+          <div class="rule-row"><div class="rule-name">当前回撤率</div><div class="rule-value">${item.currentDrawdownPct != null ? fmt(item.currentDrawdownPct, 2) + '%' : '-'}</div></div>
+        </div>
+        <div class="mini-item">
+          <div class="rule-row"><div class="rule-name">连续亏损</div><div class="rule-value">${item.consecutiveLosses ?? 0} 笔</div></div>
+        </div>
+        <div class="mini-item">
+          <div class="rule-row"><div class="rule-name">更新时间</div><div class="rule-value">${updatedAt}</div></div>
+        </div>
+      `;
+    }
+
+    function attributionTable(title, rows, keyLabel) {
+      if (!rows || !rows.length) {
+        return `
+          <div class="mini-title">${title}</div>
+          <div class="empty">暂无数据。</div>
+        `;
+      }
+      const body = rows.map(row => {
+        const netPnl = row.netPnlUsdt ?? row.netRealizedPnlUsdt;
+        const displayKey = title.includes('原因') ? translateReason(row.key) : row.key;
+        return `
+        <tr>
+          <td>${displayKey || '-'}</td>
+          <td>${row.tradeCount ?? 0}</td>
+          <td class="${clsByPnl(netPnl)}">${fmt(netPnl, 4)} U</td>
+          <td class="${clsByPnl(row.avgReturnPct)}">${row.avgReturnPct != null ? fmt(row.avgReturnPct, 2) + '%' : '-'}</td>
+          <td>${row.winRatePct != null ? fmt(row.winRatePct, 2) + '%' : '-'}</td>
+        </tr>
+      `;
+      }).join('');
+      return `
+        <div class="mini-title">${title}</div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>${keyLabel}</th>
+                <th>笔数</th>
+                <th>净盈亏</th>
+                <th>均收益率</th>
+                <th>胜率</th>
+              </tr>
+            </thead>
+            <tbody>${body}</tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function renderAttributionStats(stats) {
+      const wrap = document.getElementById('attributionWrap');
+      if (!wrap) return;
+      if (!stats || !stats.summary) {
+        wrap.innerHTML = '<div class="empty">暂无策略归因数据。</div>';
+        return;
+      }
+      const summary = stats.summary || {};
+      wrap.innerHTML = `
+        <div class="overview-lines attribution-summary">
+          <div class="overview-line"><span>已平仓笔数</span><strong>${summary.closedTradeCount ?? 0} 笔</strong></div>
+          <div class="overview-line"><span>分批止盈次数</span><strong>${summary.partialTakeProfitCount ?? 0} 次</strong></div>
+          <div class="overview-line"><span>平均持仓</span><strong>${summary.avgHoldMinutes != null ? fmt(summary.avgHoldMinutes, 1) + ' 分钟' : '-'}</strong></div>
+        </div>
+        ${attributionTable('按币种统计', stats.byAsset || [], '币种')}
+        ${attributionTable('按平仓原因统计', stats.byCloseReason || [], '原因')}
+        ${attributionTable('按开仓小时统计', stats.byEntryHour || [], '小时')}
+      `;
     }
 
     function renderBestWorst(data) {
@@ -2226,6 +2377,8 @@ HTML = """<!doctype html>
         renderConfigToggles(data.configToggles || []);
         renderReadiness(data.productionReadiness || []);
         renderAccountRiskStats(data.riskStats || null);
+        renderCircuitBreaker(data.accountCircuitBreaker || {});
+        renderAttributionStats(data.attributionStats || {});
       } catch (err) {
         console.error('refresh failed:', err);
         document.getElementById('stamp').textContent = '数据加载失败: ' + (err.message || err) + '，10 秒后重试...';
@@ -2310,6 +2463,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         for key, raw_value in raw_values.items():
             if key not in CONFIG_VALUE_KEYS:
                 continue
+            if key in CONFIG_INTEGER_VALUE_KEYS:
+                try:
+                    value = int(float(str(raw_value).strip()))
+                except Exception as exc:
+                    raise ValueError(f"{key} 必须填写整数") from exc
+                if value < 0:
+                    raise ValueError(f"{key} 不能小于 0")
+                if key in {"COOLDOWN_MINUTES", "CIRCUIT_BREAKER_COOLDOWN_MINUTES"} and value > 10080:
+                    raise ValueError(f"{key} 不能超过 10080 分钟")
+                normalized[key] = str(value)
+                continue
+            try:
+                value = float(str(raw_value).strip())
+            except Exception as exc:
+                raise ValueError(f"{key} 必须填写数字") from exc
+            if value < 0:
+                raise ValueError(f"{key} 不能小于 0")
+            if key == "PARTIAL_TAKE_PROFIT_CLOSE_RATIO" and not (0 < value < 1):
+                raise ValueError("PARTIAL_TAKE_PROFIT_CLOSE_RATIO 必须在 0 和 1 之间")
+            normalized[key] = f"{value:g}"
+            continue
             if key == "COOLDOWN_MINUTES":
                 try:
                     minutes = int(str(raw_value).strip())

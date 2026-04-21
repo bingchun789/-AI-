@@ -14,6 +14,7 @@ from ai_select_futures_bot import (
     LONG_STRATEGY_ID,
     SHORT_STRATEGY_ID,
     build_config,
+    estimate_position_max_loss_usdt,
     live_side_from_amount,
     load_dotenv,
     migrate_state,
@@ -95,6 +96,12 @@ def _build_local_positions(state: dict[str, Any], broker: Any) -> list[dict[str,
                 "pnlPct": pnl_pct,
                 "status": pos.get("status"),
                 "openedAt": pos.get("openedAt"),
+                "returnBasisUsdt": pos.get("returnBasisUsdt"),
+                "stopLossPrice": pos.get("stopLossPrice"),
+                "stopLossStatus": pos.get("stopLossStatus"),
+                "stopLossMode": pos.get("stopLossMode"),
+                "breakevenActivatedAt": pos.get("breakevenActivatedAt"),
+                "partialTakeProfitDoneAt": pos.get("partialTakeProfitDoneAt"),
             }
         )
     return rows
@@ -311,7 +318,45 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
             else "已关闭"
         ),
     }
-    return [*items[:5], rule, *items[5:]]
+    new_rules = [
+        {
+            "title": "账户级熔断",
+            "value": (
+                f"当日亏损 {config.daily_loss_pause_pct:.1f}% / 连亏 {config.max_consecutive_losses} 笔 / "
+                f"账户回撤 {config.max_account_drawdown_pct:.1f}% 任一触发，暂停开仓 {config.circuit_breaker_cooldown_minutes} 分钟"
+                if config.enable_account_circuit_breaker
+                else "已关闭"
+            ),
+        },
+        {
+            "title": "风险仓位",
+            "value": (
+                f"每笔按账户权益 {config.risk_per_trade_pct:.2f}% 风险预算反推仓位，"
+                f"下限 {config.min_notional_per_trade_usdt:.0f}U，上限 {config.max_notional_per_trade_usdt:.0f}U"
+                if config.enable_risk_position_sizing
+                else f"固定每笔 {config.usdt_per_trade:.0f}U"
+            ),
+        },
+        {
+            "title": "组合风险",
+            "value": (
+                f"单边最大开口风险 {config.max_side_open_risk_pct:.1f}%，总开口风险 {config.max_total_open_risk_pct:.1f}%，"
+                f"同向高相关持仓最多 {config.max_correlated_positions_per_side} 个"
+                if config.enable_portfolio_risk_cap
+                else "已关闭"
+            ),
+        },
+        {
+            "title": "保本与分批止盈",
+            "value": (
+                f"收益达到 {config.breakeven_trigger_pct:.1f}% 后止损抬到保本+{config.breakeven_buffer_pct:.1f}%；"
+                f"达到 {config.partial_take_profit_trigger_pct:.1f}% 后先平 {config.partial_take_profit_close_ratio:.0%}"
+                if config.enable_breakeven_stop or config.enable_partial_take_profit
+                else "已关闭"
+            ),
+        },
+    ]
+    return [*items[:5], rule, *new_rules, *items[5:]]
 
 
 def _augment_config_toggles(items: list[dict[str, Any]], config: Any) -> list[dict[str, Any]]:
@@ -321,7 +366,179 @@ def _augment_config_toggles(items: list[dict[str, Any]], config: Any) -> list[di
         "enabled": config.enable_min_signal_count_filter,
         "detail": f"同方向强烈看多/看空少于 {config.min_signal_count_to_open} 个时，不开该方向新仓。",
     }
-    return [items[0], toggle, *items[1:]] if items else [toggle]
+    risk_controls = [
+        {
+            "key": "ENABLE_ACCOUNT_CIRCUIT_BREAKER",
+            "label": "账户级熔断",
+            "enabled": config.enable_account_circuit_breaker,
+            "detail": "触发当日亏损、连续亏损或账户回撤阈值后，只暂停新开仓，不影响已有仓位平仓。",
+        },
+        {
+            "key": "DAILY_LOSS_PAUSE_PCT",
+            "label": "当日亏损熔断",
+            "type": "number",
+            "value": float(config.daily_loss_pause_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "detail": "当天已实现净亏损达到这个比例后暂停开新仓。",
+        },
+        {
+            "key": "MAX_CONSECUTIVE_LOSSES",
+            "label": "连续亏损熔断",
+            "type": "number",
+            "value": int(config.max_consecutive_losses),
+            "min": 0,
+            "step": 1,
+            "unit": "笔",
+            "detail": "最近连续亏损达到这个笔数后暂停开新仓。",
+        },
+        {
+            "key": "MAX_ACCOUNT_DRAWDOWN_PCT",
+            "label": "账户回撤熔断",
+            "type": "number",
+            "value": float(config.max_account_drawdown_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "detail": "账户权益相对历史峰值回撤达到这个比例后暂停开新仓。",
+        },
+        {
+            "key": "CIRCUIT_BREAKER_COOLDOWN_MINUTES",
+            "label": "熔断暂停时间",
+            "type": "number",
+            "value": int(config.circuit_breaker_cooldown_minutes),
+            "min": 0,
+            "step": 1,
+            "unit": "分钟",
+            "detail": "熔断触发后至少暂停开仓的时间。",
+        },
+        {
+            "key": "ENABLE_RISK_POSITION_SIZING",
+            "label": "风险仓位",
+            "enabled": config.enable_risk_position_sizing,
+            "detail": "按账户权益和止损距离反推下单金额，不再只用固定 USDT。",
+        },
+        {
+            "key": "RISK_PER_TRADE_PCT",
+            "label": "单笔风险预算",
+            "type": "number",
+            "value": float(config.risk_per_trade_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "detail": "每笔止损最多亏账户权益的比例。",
+        },
+        {
+            "key": "MIN_NOTIONAL_PER_TRADE_USDT",
+            "label": "最小下单金额",
+            "type": "number",
+            "value": float(config.min_notional_per_trade_usdt),
+            "min": 0,
+            "step": 1,
+            "unit": "USDT",
+            "detail": "风险仓位计算后低于这个值会按这个值下单。",
+        },
+        {
+            "key": "MAX_NOTIONAL_PER_TRADE_USDT",
+            "label": "最大下单金额",
+            "type": "number",
+            "value": float(config.max_notional_per_trade_usdt),
+            "min": 0,
+            "step": 1,
+            "unit": "USDT",
+            "detail": "风险仓位计算后高于这个值会被封顶。",
+        },
+        {
+            "key": "ENABLE_PORTFOLIO_RISK_CAP",
+            "label": "组合风险限制",
+            "enabled": config.enable_portfolio_risk_cap,
+            "detail": "限制单边/总风险敞口，并限制同向高相关持仓数量。",
+        },
+        {
+            "key": "MAX_SIDE_OPEN_RISK_PCT",
+            "label": "单边风险上限",
+            "type": "number",
+            "value": float(config.max_side_open_risk_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "detail": "做多或做空任一方向的预估最大止损风险上限。",
+        },
+        {
+            "key": "MAX_TOTAL_OPEN_RISK_PCT",
+            "label": "总风险上限",
+            "type": "number",
+            "value": float(config.max_total_open_risk_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "detail": "所有持仓合计预估最大止损风险上限。",
+        },
+        {
+            "key": "MAX_CORRELATED_POSITIONS_PER_SIDE",
+            "label": "同向相关仓位上限",
+            "type": "number",
+            "value": int(config.max_correlated_positions_per_side),
+            "min": 0,
+            "step": 1,
+            "unit": "个",
+            "detail": "候选币与同向已有持仓高度相关时，最多允许的相关持仓数量。",
+        },
+        {
+            "key": "ENABLE_BREAKEVEN_STOP",
+            "label": "保本止损",
+            "enabled": config.enable_breakeven_stop,
+            "detail": "盈利达到阈值后，把止损抬到开仓成本附近。",
+        },
+        {
+            "key": "BREAKEVEN_TRIGGER_PCT",
+            "label": "保本触发收益率",
+            "type": "number",
+            "value": float(config.breakeven_trigger_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "detail": "持仓收益率达到这个值后触发保本止损。",
+        },
+        {
+            "key": "BREAKEVEN_BUFFER_PCT",
+            "label": "保本缓冲",
+            "type": "number",
+            "value": float(config.breakeven_buffer_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "detail": "止损抬到成本后额外锁住的收益率。",
+        },
+        {
+            "key": "ENABLE_PARTIAL_TAKE_PROFIT",
+            "label": "分批止盈",
+            "enabled": config.enable_partial_take_profit,
+            "detail": "盈利达到阈值后先减掉一部分仓位，剩余仓位继续跑。",
+        },
+        {
+            "key": "PARTIAL_TAKE_PROFIT_TRIGGER_PCT",
+            "label": "分批止盈触发",
+            "type": "number",
+            "value": float(config.partial_take_profit_trigger_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "detail": "持仓收益率达到这个值后执行一次分批止盈。",
+        },
+        {
+            "key": "PARTIAL_TAKE_PROFIT_CLOSE_RATIO",
+            "label": "分批止盈比例",
+            "type": "number",
+            "value": float(config.partial_take_profit_close_ratio),
+            "min": 0.01,
+            "step": 0.01,
+            "unit": "0-1",
+            "detail": "例如 0.5 表示先平掉一半仓位。",
+        },
+    ]
+    return [items[0], toggle, *risk_controls, *items[1:]] if items else [toggle, *risk_controls]
 
 
 def _format_unopened_detail(item: dict[str, Any]) -> str | None:
@@ -353,6 +570,17 @@ def _format_unopened_detail(item: dict[str, Any]) -> str | None:
         max_usage = item.get("maxMarginUsagePct")
         if current_usage not in (None, "") and max_usage not in (None, ""):
             return f"当前保证金使用率 {current_usage}% ，上限 {max_usage}%"
+    if reason == "account_circuit_breaker":
+        until_ts = item.get("circuitBreakerUntil")
+        reasons = ",".join(item.get("circuitBreakerReasons") or [])
+        if until_ts not in (None, ""):
+            return f"账户熔断生效到 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(until_ts)))}，原因: {reasons or '-'}"
+    if reason == "side_risk_limit":
+        return f"预计单边风险 {item.get('projectedSideRiskPct', '-')}%，上限 {item.get('maxSideOpenRiskPct', '-')}%"
+    if reason == "portfolio_risk_limit":
+        return f"预计总风险 {item.get('projectedTotalRiskPct', '-')}%，上限 {item.get('maxTotalOpenRiskPct', '-')}"
+    if reason == "correlated_cluster_limit":
+        return f"同向高相关持仓 {item.get('correlatedMatchCount', '-')} 个，上限 {item.get('maxCorrelatedPositionsPerSide', '-')}"
     if reason == "correlated_with_existing":
         correlated_with = item.get("correlatedWith")
         corr = item.get("correlation")
@@ -515,6 +743,7 @@ def _build_risk_stats(
     closed_history: list[dict[str, Any]],
     account_snapshot: dict[str, Any] | None,
     equity_history: list[dict[str, Any]],
+    config: Any,
 ) -> dict[str, Any]:
     ordered_closes = sorted(closed_history, key=lambda item: item.get("timestamp", 0))
     pnl_values: list[Decimal] = [
@@ -589,6 +818,19 @@ def _build_risk_stats(
     current_position_value = sum(
         (row.get("currentValueUsdt") or Decimal("0")) for row in positions
     )
+    stop_loss_pct = Decimal(str(config.stop_loss_pct))
+    open_risk_by_side = {LONG: Decimal("0"), SHORT: Decimal("0")}
+    for row in positions:
+        try:
+            estimated_risk = estimate_position_max_loss_usdt(row, stop_loss_pct)
+        except Exception:
+            estimated_risk = None
+        if estimated_risk is None:
+            continue
+        open_risk_by_side[row.get("side", LONG)] = (
+            open_risk_by_side.get(row.get("side", LONG), Decimal("0")) + estimated_risk
+        )
+    open_risk_total = open_risk_by_side[LONG] + open_risk_by_side[SHORT]
     current_equity = _extract_account_equity(account_snapshot)
     account_peak_equity = None
     account_max_drawdown = None
@@ -657,6 +899,18 @@ def _build_risk_stats(
         "currentUnrealizedPnlUsdt": str(current_unrealized),
         "currentPositionValueUsdt": str(current_position_value),
         "netRealizedPnlUsdt": str(sum(pnl_values, Decimal("0"))),
+        "openRiskUsdt": str(open_risk_total),
+        "openLongRiskUsdt": str(open_risk_by_side[LONG]),
+        "openShortRiskUsdt": str(open_risk_by_side[SHORT]),
+        "openRiskPct": str((open_risk_total / current_equity) * Decimal("100"))
+        if current_equity not in (None, Decimal("0"))
+        else None,
+        "openLongRiskPct": str((open_risk_by_side[LONG] / current_equity) * Decimal("100"))
+        if current_equity not in (None, Decimal("0"))
+        else None,
+        "openShortRiskPct": str((open_risk_by_side[SHORT] / current_equity) * Decimal("100"))
+        if current_equity not in (None, Decimal("0"))
+        else None,
     }
 
 
@@ -915,6 +1169,136 @@ def _match_close_event(
             best_score = score
             best_event = event
     return best_event
+
+
+def _event_net_pnl(event: dict[str, Any]) -> Decimal | None:
+    net_pnl_raw = event.get("netRealizedPnlUsdt")
+    if net_pnl_raw in (None, ""):
+        net_pnl_raw = event.get("realizedPnlUsdt")
+    if net_pnl_raw in (None, ""):
+        return None
+    try:
+        return Decimal(str(net_pnl_raw))
+    except Exception:
+        return None
+
+
+def _event_return_pct(event: dict[str, Any], net_pnl: Decimal | None) -> Decimal | None:
+    if net_pnl is None:
+        return None
+    for key in ("returnBasisUsdt", "entryNotionalUsdt"):
+        raw_value = event.get(key)
+        if raw_value in (None, "", 0, "0"):
+            continue
+        try:
+            basis = abs(Decimal(str(raw_value)))
+        except Exception:
+            continue
+        if basis != Decimal("0"):
+            return (net_pnl / basis) * Decimal("100")
+    return None
+
+
+def _aggregate_attribution_rows(
+    rows: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    output = []
+    for key, item in rows.items():
+        trade_count = int(item["tradeCount"])
+        win_count = int(item["winCount"])
+        return_values = item.pop("_returnValues", [])
+        avg_return_pct = (
+            sum(return_values, Decimal("0")) / Decimal(len(return_values))
+            if return_values
+            else None
+        )
+        output.append(
+            {
+                "key": key,
+                "tradeCount": trade_count,
+                "winCount": win_count,
+                "lossCount": int(item["lossCount"]),
+                "winRatePct": str((Decimal(win_count) / Decimal(trade_count)) * Decimal("100"))
+                if trade_count
+                else None,
+                "netRealizedPnlUsdt": str(item["netRealizedPnlUsdt"]),
+                "avgReturnPct": str(avg_return_pct) if avg_return_pct is not None else None,
+            }
+        )
+    output.sort(key=lambda item: Decimal(str(item["netRealizedPnlUsdt"])), reverse=True)
+    return output
+
+
+def _build_attribution_stats(
+    closed_history: list[dict[str, Any]],
+    all_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    by_asset: dict[str, dict[str, Any]] = {}
+    by_reason: dict[str, dict[str, Any]] = {}
+    by_hour: dict[str, dict[str, Any]] = {}
+    total_hold_seconds = Decimal("0")
+    hold_count = 0
+
+    for event in closed_history:
+        net_pnl = _event_net_pnl(event)
+        if net_pnl is None:
+            continue
+        return_pct = _event_return_pct(event, net_pnl)
+        asset_key = event.get("contractSymbol") or event.get("asset") or "-"
+        reason_key = event.get("reason") or "-"
+        opened_at = event.get("openedAt") or event.get("timestamp")
+        hour_key = "-"
+        if opened_at not in (None, ""):
+            try:
+                hour_key = time.strftime("%H:00", time.localtime(float(opened_at)))
+            except Exception:
+                hour_key = "-"
+        for rows, key in ((by_asset, asset_key), (by_reason, reason_key), (by_hour, hour_key)):
+            row = rows.setdefault(
+                str(key),
+                {
+                    "tradeCount": 0,
+                    "winCount": 0,
+                    "lossCount": 0,
+                    "netRealizedPnlUsdt": Decimal("0"),
+                    "_returnValues": [],
+                },
+            )
+            row["tradeCount"] += 1
+            if net_pnl > 0:
+                row["winCount"] += 1
+            elif net_pnl < 0:
+                row["lossCount"] += 1
+            row["netRealizedPnlUsdt"] += net_pnl
+            if return_pct is not None:
+                row["_returnValues"].append(return_pct)
+        if opened_at not in (None, "") and event.get("timestamp") not in (None, ""):
+            try:
+                hold_seconds = Decimal(str(float(event["timestamp"]) - float(opened_at)))
+            except Exception:
+                hold_seconds = Decimal("0")
+            if hold_seconds > Decimal("0"):
+                total_hold_seconds += hold_seconds
+                hold_count += 1
+
+    partial_count = sum(
+        1 for event in all_history if event.get("action") in {"partial_exit_long", "partial_exit_short"}
+    )
+    avg_hold_minutes = (
+        total_hold_seconds / Decimal(hold_count) / Decimal("60")
+        if hold_count
+        else None
+    )
+    return {
+        "summary": {
+            "closedTradeCount": len(closed_history),
+            "partialTakeProfitCount": partial_count,
+            "avgHoldMinutes": str(avg_hold_minutes) if avg_hold_minutes is not None else None,
+        },
+        "byAsset": _aggregate_attribution_rows(by_asset)[:12],
+        "byCloseReason": _aggregate_attribution_rows(by_reason),
+        "byEntryHour": _aggregate_attribution_rows(by_hour),
+    }
 
 
 def _build_trade_history_from_close_events(
@@ -1826,6 +2210,9 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
                     "openedAt": local_position.get("openedAt"),
                     "stopLossPrice": local_position.get("stopLossPrice"),
                     "stopLossStatus": local_position.get("stopLossStatus"),
+                    "stopLossMode": local_position.get("stopLossMode"),
+                    "breakevenActivatedAt": local_position.get("breakevenActivatedAt"),
+                    "partialTakeProfitDoneAt": local_position.get("partialTakeProfitDoneAt"),
                 }
             )
         long_positions = [row for row in positions if row.get("side") == LONG]
@@ -2005,8 +2392,11 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             history_for_display,
             account_snapshot,
             equity_history,
+            config,
         ),
         "recoveryStats": _build_recovery_stats(history_for_display),
+        "attributionStats": _build_attribution_stats(history_for_display, state.get("history", [])),
+        "accountCircuitBreaker": state.get("riskState", {}).get("accountCircuitBreaker", {}),
         "summary": {
             "openPositions": len(positions),
             "totalPositionValueUsdt": str(
@@ -2041,6 +2431,11 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
                 "leverage": str(row["leverage"]) if row.get("leverage") is not None else None,
                 "marginMode": row.get("marginMode"),
                 "openedAt": row.get("openedAt"),
+                "stopLossPrice": row.get("stopLossPrice"),
+                "stopLossStatus": row.get("stopLossStatus"),
+                "stopLossMode": row.get("stopLossMode"),
+                "breakevenActivatedAt": row.get("breakevenActivatedAt"),
+                "partialTakeProfitDoneAt": row.get("partialTakeProfitDoneAt"),
             }
             for row in positions
         ],

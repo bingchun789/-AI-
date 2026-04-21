@@ -151,12 +151,32 @@ class BotConfig:
     signal_drop_guard_min_candidates: int
     signal_lost_exit_confirm_rounds: int
     estimated_taker_fee_rate: float
+    enable_account_circuit_breaker: bool
+    daily_loss_pause_pct: float
+    max_consecutive_losses: int
+    max_account_drawdown_pct: float
+    circuit_breaker_cooldown_minutes: int
+    enable_risk_position_sizing: bool
+    risk_per_trade_pct: float
+    min_notional_per_trade_usdt: float
+    max_notional_per_trade_usdt: float
+    enable_portfolio_risk_cap: bool
+    max_side_open_risk_pct: float
+    max_total_open_risk_pct: float
+    max_correlated_positions_per_side: int
+    enable_breakeven_stop: bool
+    breakeven_trigger_pct: float
+    breakeven_buffer_pct: float
+    enable_partial_take_profit: bool
+    partial_take_profit_trigger_pct: float
+    partial_take_profit_close_ratio: float
     strategy_config_file: Path
     strategy_status_file: Path
     state_file: Path
     positive_snapshot_file: Path
     negative_snapshot_file: Path
     log_file: Path
+    equity_history_file: Path
 
 
 class StateStore:
@@ -209,6 +229,10 @@ def enter_action(side: str) -> str:
 
 def exit_action(side: str) -> str:
     return "exit_long" if side == LONG else "exit_short"
+
+
+def partial_exit_action(side: str) -> str:
+    return "partial_exit_long" if side == LONG else "partial_exit_short"
 
 
 def signal_enter_reason(side: str) -> str:
@@ -275,6 +299,8 @@ def migrate_state(state: dict[str, Any]) -> dict[str, Any]:
             strategy_id = LONG_STRATEGY_ID if side == LONG else SHORT_STRATEGY_ID
         migrated_history.append({**event, "side": side, "strategyId": strategy_id})
     state["history"] = migrated_history
+    risk_state = state.get("riskState")
+    state["riskState"] = risk_state if isinstance(risk_state, dict) else {}
     return state
 
 
@@ -379,7 +405,7 @@ class BrokerAdapter:
         stop_loss_pct: float,
         dry_run: bool,
     ) -> dict[str, Any]:
-        stop_price = calculate_stop_loss_price(
+        stop_price = resolve_effective_stop_loss_price(
             position,
             Decimal(str(stop_loss_pct)),
         )
@@ -389,6 +415,7 @@ class BrokerAdapter:
             "configured": stop_price is not None,
             "stopPrice": format_decimal_value(stop_price),
             "stopLossPct": format_decimal_value(stop_loss_pct),
+            "mode": "breakeven" if position.get("stopLossOverridePrice") else "fixed",
         }
 
     def close_position(
@@ -399,6 +426,7 @@ class BrokerAdapter:
         side: str,
         position: dict[str, Any],
         dry_run: bool,
+        close_ratio: float | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -501,7 +529,15 @@ class MockBrokerAdapter(BrokerAdapter):
         side: str,
         position: dict[str, Any],
         dry_run: bool,
+        close_ratio: float | None = None,
     ) -> dict[str, Any]:
+        total_qty = infer_position_quantity(position)
+        exit_qty = None
+        if total_qty is not None:
+            if close_ratio is not None and 0 < float(close_ratio) < 1:
+                exit_qty = total_qty * Decimal(str(close_ratio))
+            else:
+                exit_qty = total_qty
         order_id = f"mock-close-{int(time.time() * 1000)}-{contract_symbol}"
         status = "DRY_RUN_CLOSE_ACCEPTED" if dry_run else "MOCK_CLOSED"
         return {
@@ -510,9 +546,11 @@ class MockBrokerAdapter(BrokerAdapter):
             "contractSymbol": contract_symbol,
             "asset": asset,
             "exitPrice": format(self.get_mark_price(contract_symbol), "f"),
-            "confirmedClosed": True,
+            "confirmedClosed": close_ratio is None or float(close_ratio) >= 1,
             "closedAtMs": int(time.time() * 1000),
             "closeRetryCount": 0,
+            "exitQty": format_decimal_value(exit_qty),
+            "partial": close_ratio is not None and 0 < float(close_ratio) < 1,
         }
 
     def ensure_stop_loss(
@@ -524,7 +562,7 @@ class MockBrokerAdapter(BrokerAdapter):
         stop_loss_pct: float,
         dry_run: bool,
     ) -> dict[str, Any]:
-        stop_price = calculate_stop_loss_price(
+        stop_price = resolve_effective_stop_loss_price(
             position,
             Decimal(str(stop_loss_pct)),
         )
@@ -534,6 +572,7 @@ class MockBrokerAdapter(BrokerAdapter):
             "configured": stop_price is not None,
             "stopPrice": format_decimal_value(stop_price),
             "stopLossPct": format_decimal_value(stop_loss_pct),
+            "mode": "breakeven" if position.get("stopLossOverridePrice") else "fixed",
         }
 
 
@@ -737,6 +776,29 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
                 "Increase USDT_PER_TRADE or skip this symbol."
             )
         return quantity.normalize()
+
+    def _quantize_existing_quantity(
+        self, contract_symbol: str, quantity: Decimal
+    ) -> Decimal:
+        meta = self._get_symbol_meta(contract_symbol)
+        filters = meta.get("filters", [])
+        lot_size = next(
+            item for item in filters if item.get("filterType") == "LOT_SIZE"
+        )
+        market_lot_size = next(
+            (item for item in filters if item.get("filterType") == "MARKET_LOT_SIZE"),
+            None,
+        )
+        qty_filter = market_lot_size or lot_size
+        step_size = Decimal(str(qty_filter["stepSize"]))
+        min_qty = Decimal(str(qty_filter["minQty"]))
+        steps = (quantity / step_size).quantize(Decimal("1"), rounding=ROUND_DOWN)
+        normalized = (steps * step_size).normalize()
+        if normalized < min_qty:
+            raise ValueError(
+                f"{contract_symbol} reduce quantity {normalized} is below minQty {min_qty}."
+            )
+        return normalized
 
     def _ensure_margin_and_leverage(self, contract_symbol: str) -> None:
         margin_type = "ISOLATED" if self.required_margin_mode == "ISOLATED" else "CROSSED"
@@ -982,6 +1044,7 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
         side: str,
         position: dict[str, Any],
         dry_run: bool,
+        close_ratio: float | None = None,
     ) -> dict[str, Any]:
         live_position = self.get_live_position(contract_symbol, side)
         if not live_position:
@@ -1011,6 +1074,13 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
 
         order_side = "SELL" if position_amt > 0 else "BUY"
         quantity = abs(position_amt)
+        is_partial = close_ratio is not None and 0 < float(close_ratio) < 1
+        close_quantity = quantity
+        if is_partial:
+            close_quantity = self._quantize_existing_quantity(
+                contract_symbol,
+                quantity * Decimal(str(close_ratio)),
+            )
         path = "/fapi/v1/order/test" if dry_run else "/fapi/v1/order"
         retry_count = 0
         if not dry_run:
@@ -1082,11 +1152,11 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
             )
 
         try:
-            result = submit_close_market(quantity)
+            result = submit_close_market(close_quantity)
         except Exception as exc:
             if "-4131" in str(exc):
                 try:
-                    result = submit_close_limit_ioc(quantity)
+                    result = submit_close_limit_ioc(close_quantity)
                 except Exception as fallback_exc:
                     return {
                         "orderId": f"failed-close-{int(time.time() * 1000)}",
@@ -1097,8 +1167,10 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
                         "confirmedClosed": False,
                         "closedAtMs": int(time.time() * 1000),
                         "closeRetryCount": retry_count,
-                        "quantity": format(quantity, "f"),
+                        "quantity": format(close_quantity, "f"),
+                        "exitQty": format(close_quantity, "f"),
                         "error": str(fallback_exc),
+                        "partial": is_partial,
                     }
             else:
                 return {
@@ -1110,12 +1182,16 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
                     "confirmedClosed": False,
                     "closedAtMs": int(time.time() * 1000),
                     "closeRetryCount": retry_count,
-                    "quantity": format(quantity, "f"),
+                    "quantity": format(close_quantity, "f"),
+                    "exitQty": format(close_quantity, "f"),
                     "error": str(exc),
+                    "partial": is_partial,
                 }
         self._position_risks = None
-        confirmed_closed = True
-        if not dry_run:
+        confirmed_closed = not is_partial
+        remaining_quantity = None
+        remaining_notional = None
+        if not dry_run and not is_partial:
             for _ in range(2):
                 remaining_position = self.get_live_position(contract_symbol, side)
                 if remaining_position is None:
@@ -1167,6 +1243,21 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
             else:
                 remaining_position = self.get_live_position(contract_symbol, side)
                 confirmed_closed = remaining_position is None
+        elif not dry_run and is_partial:
+            remaining_position = self.get_live_position(contract_symbol, side)
+            if remaining_position is not None:
+                remaining_amt = abs(Decimal(str(remaining_position.get("positionAmt", "0"))))
+                if remaining_amt > Decimal("0"):
+                    confirmed_closed = False
+                    remaining_quantity = format(remaining_amt, "f")
+                    remaining_notional = format(
+                        abs(Decimal(str(remaining_position.get("notional", "0")))),
+                        "f",
+                    )
+                else:
+                    confirmed_closed = True
+            else:
+                confirmed_closed = True
         return {
             "orderId": result.get("orderId") or f"test-close-{int(time.time() * 1000)}",
             "status": result.get("status") or ("TESTNET_CLOSE_ACCEPTED" if dry_run else "FILLED"),
@@ -1178,7 +1269,11 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
             or result.get("transactTime")
             or int(time.time() * 1000),
             "closeRetryCount": retry_count,
-            "quantity": format(quantity, "f"),
+            "quantity": format(close_quantity, "f"),
+            "exitQty": format(close_quantity, "f"),
+            "partial": is_partial,
+            "remainingQuantity": remaining_quantity,
+            "remainingNotionalUsdt": remaining_notional,
         }
 
     def ensure_stop_loss(
@@ -1190,7 +1285,7 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
         stop_loss_pct: float,
         dry_run: bool,
     ) -> dict[str, Any]:
-        stop_price = calculate_stop_loss_price(
+        stop_price = resolve_effective_stop_loss_price(
             position,
             Decimal(str(stop_loss_pct)),
         )
@@ -1211,6 +1306,7 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
                 "configured": True,
                 "stopPrice": format(stop_price, "f"),
                 "stopLossPct": format_decimal_value(stop_loss_pct),
+                "mode": "breakeven" if position.get("stopLossOverridePrice") else "fixed",
             }
 
         protective_orders = [
@@ -1232,6 +1328,7 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
                     "configured": True,
                     "stopPrice": format(stop_price, "f"),
                     "stopLossPct": format_decimal_value(stop_loss_pct),
+                    "mode": "breakeven" if position.get("stopLossOverridePrice") else "fixed",
                 }
 
         self._cancel_protective_stop_orders(contract_symbol, side)
@@ -1254,6 +1351,7 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
             "configured": True,
             "stopPrice": format(stop_price, "f"),
             "stopLossPct": format_decimal_value(stop_loss_pct),
+            "mode": "breakeven" if position.get("stopLossOverridePrice") else "fixed",
         }
 
     def get_account_snapshot(self) -> dict[str, Any] | None:
@@ -1460,6 +1558,91 @@ def is_in_cooldown(
     return False
 
 
+def extract_account_equity(account_snapshot: dict[str, Any] | None) -> Decimal | None:
+    if not account_snapshot:
+        return None
+    total_margin_balance = account_snapshot.get("totalMarginBalance")
+    if total_margin_balance not in (None, ""):
+        return Decimal(str(total_margin_balance))
+    total_wallet_balance = account_snapshot.get("totalWalletBalance")
+    total_unrealized_profit = account_snapshot.get("totalUnrealizedProfit")
+    if total_wallet_balance in (None, ""):
+        return None
+    equity = Decimal(str(total_wallet_balance))
+    if total_unrealized_profit not in (None, ""):
+        equity += Decimal(str(total_unrealized_profit))
+    return equity
+
+
+def record_account_equity_snapshot(
+    equity_history_file: Path, account_snapshot: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    existing = []
+    if equity_history_file.exists():
+        try:
+            payload = json.loads(equity_history_file.read_text(encoding="utf-8-sig"))
+            if isinstance(payload, list):
+                existing = payload
+        except Exception:
+            existing = []
+
+    equity = extract_account_equity(account_snapshot)
+    now = time.time()
+    if equity is not None:
+        last_point = existing[-1] if existing else None
+        should_append = True
+        if isinstance(last_point, dict):
+            try:
+                last_ts = float(last_point.get("timestamp", 0) or 0)
+            except Exception:
+                last_ts = 0.0
+            try:
+                last_equity = Decimal(str(last_point.get("equityUsdt", "0")))
+            except Exception:
+                last_equity = Decimal("0")
+            if now - last_ts < 8 and last_equity == equity:
+                should_append = False
+        if should_append:
+            equity_history_file.parent.mkdir(parents=True, exist_ok=True)
+            existing.append(
+                {
+                    "timestamp": now,
+                    "equityUsdt": str(equity),
+                    "walletBalanceUsdt": account_snapshot.get("totalWalletBalance")
+                    if account_snapshot
+                    else None,
+                    "unrealizedPnlUsdt": account_snapshot.get("totalUnrealizedProfit")
+                    if account_snapshot
+                    else None,
+                }
+            )
+            existing = existing[-20000:]
+            equity_history_file.write_text(
+                json.dumps(existing, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    return existing
+
+
+def local_day_start_timestamp(now: float | None = None) -> float:
+    if now is None:
+        now = time.time()
+    local = time.localtime(now)
+    return time.mktime(
+        (
+            local.tm_year,
+            local.tm_mon,
+            local.tm_mday,
+            0,
+            0,
+            0,
+            local.tm_wday,
+            local.tm_yday,
+            local.tm_isdst,
+        )
+    )
+
+
 def infer_position_quantity(position: dict[str, Any]) -> Decimal | None:
     quantity_raw = position.get("quantity")
     if quantity_raw not in (None, ""):
@@ -1585,6 +1768,308 @@ def infer_return_basis_usdt(position: dict[str, Any]) -> Decimal | None:
                 return estimated_margin
         return entry_notional
     return None
+
+
+def clamp_decimal(
+    value: Decimal,
+    *,
+    min_value: Decimal | None = None,
+    max_value: Decimal | None = None,
+) -> Decimal:
+    if min_value is not None and value < min_value:
+        value = min_value
+    if max_value is not None and value > max_value:
+        value = max_value
+    return value
+
+
+def estimate_position_max_loss_usdt(
+    position: dict[str, Any], stop_loss_pct: Decimal
+) -> Decimal | None:
+    return_basis = infer_return_basis_usdt(position)
+    if return_basis is None or stop_loss_pct <= Decimal("0"):
+        return None
+    return (return_basis * stop_loss_pct) / Decimal("100")
+
+
+def estimate_entry_max_loss_usdt(config: BotConfig, notional_usdt: Decimal) -> Decimal | None:
+    if notional_usdt <= Decimal("0"):
+        return None
+    leverage = Decimal(str(config.leverage))
+    if leverage <= Decimal("0"):
+        return None
+    margin_basis = notional_usdt / leverage
+    stop_loss_pct = Decimal(str(config.stop_loss_pct))
+    if stop_loss_pct <= Decimal("0"):
+        return None
+    return (margin_basis * stop_loss_pct) / Decimal("100")
+
+
+def calculate_open_risk_summary(
+    state: dict[str, Any], config: BotConfig
+) -> dict[str, Decimal]:
+    stop_loss_pct = Decimal(str(config.stop_loss_pct))
+    total = Decimal("0")
+    by_side = {LONG: Decimal("0"), SHORT: Decimal("0")}
+    for position in state.get("positions", {}).values():
+        if not isinstance(position, dict):
+            continue
+        side = side_from_position(position)
+        risk = estimate_position_max_loss_usdt(position, stop_loss_pct)
+        if risk is None:
+            continue
+        total += risk
+        by_side[side] = by_side.get(side, Decimal("0")) + risk
+    return {
+        "totalRiskUsdt": total,
+        "longRiskUsdt": by_side.get(LONG, Decimal("0")),
+        "shortRiskUsdt": by_side.get(SHORT, Decimal("0")),
+    }
+
+
+def resolve_entry_notional_usdt(
+    *,
+    config: BotConfig,
+    account_equity: Decimal | None,
+) -> dict[str, Decimal | str | None]:
+    fixed_notional = Decimal(str(config.usdt_per_trade))
+    result: dict[str, Decimal | str | None] = {
+        "mode": "fixed",
+        "notionalUsdt": fixed_notional,
+        "riskBudgetUsdt": None,
+        "estimatedRiskUsdt": estimate_entry_max_loss_usdt(config, fixed_notional),
+    }
+    if (
+        not config.enable_risk_position_sizing
+        or account_equity is None
+        or account_equity <= Decimal("0")
+    ):
+        return result
+
+    stop_loss_pct = Decimal(str(config.stop_loss_pct))
+    leverage = Decimal(str(config.leverage))
+    risk_per_trade_pct = Decimal(str(config.risk_per_trade_pct))
+    if (
+        stop_loss_pct <= Decimal("0")
+        or leverage <= Decimal("0")
+        or risk_per_trade_pct <= Decimal("0")
+    ):
+        return result
+
+    risk_budget = (account_equity * risk_per_trade_pct) / Decimal("100")
+    margin_budget = (risk_budget * Decimal("100")) / stop_loss_pct
+    notional = margin_budget * leverage
+    notional = clamp_decimal(
+        notional,
+        min_value=Decimal(str(config.min_notional_per_trade_usdt)),
+        max_value=Decimal(str(config.max_notional_per_trade_usdt)),
+    )
+    return {
+        "mode": "risk_budget",
+        "notionalUsdt": notional,
+        "riskBudgetUsdt": risk_budget,
+        "estimatedRiskUsdt": estimate_entry_max_loss_usdt(config, notional),
+    }
+
+
+def calculate_breakeven_stop_price(
+    position: dict[str, Any], breakeven_buffer_pct: Decimal
+) -> Decimal | None:
+    quantity = infer_position_quantity(position)
+    entry_price = decimal_or_none(position.get("entryPrice"))
+    return_basis = infer_return_basis_usdt(position)
+    if quantity in (None, Decimal("0")) or entry_price is None or return_basis is None:
+        return None
+    locked_profit_usdt = (return_basis * max(breakeven_buffer_pct, Decimal("0"))) / Decimal("100")
+    price_delta = locked_profit_usdt / quantity
+    if side_from_position(position) == SHORT:
+        stop_price = entry_price - price_delta
+    else:
+        stop_price = entry_price + price_delta
+    if stop_price <= Decimal("0"):
+        return None
+    return stop_price
+
+
+def resolve_effective_stop_loss_price(
+    position: dict[str, Any], stop_loss_pct: Decimal
+) -> Decimal | None:
+    override_price = decimal_or_none(position.get("stopLossOverridePrice"))
+    if override_price is not None and override_price > Decimal("0"):
+        return override_price
+    return calculate_stop_loss_price(position, stop_loss_pct)
+
+
+def should_activate_breakeven_stop(
+    *,
+    config: BotConfig,
+    position: dict[str, Any],
+    current_pnl_pct: Decimal | None,
+) -> bool:
+    if not config.enable_breakeven_stop:
+        return False
+    if current_pnl_pct is None:
+        return False
+    if position.get("breakevenActivatedAt") not in (None, ""):
+        return False
+    return current_pnl_pct >= Decimal(str(config.breakeven_trigger_pct))
+
+
+def should_trigger_partial_take_profit(
+    *,
+    config: BotConfig,
+    position: dict[str, Any],
+    current_pnl_pct: Decimal | None,
+) -> bool:
+    if not config.enable_partial_take_profit:
+        return False
+    if current_pnl_pct is None:
+        return False
+    if position.get("partialTakeProfitDoneAt") not in (None, ""):
+        return False
+    close_ratio = Decimal(str(config.partial_take_profit_close_ratio))
+    if close_ratio <= Decimal("0") or close_ratio >= Decimal("1"):
+        return False
+    return current_pnl_pct >= Decimal(str(config.partial_take_profit_trigger_pct))
+
+
+def recent_consecutive_losses(state: dict[str, Any]) -> int:
+    streak = 0
+    for event in reversed(state.get("history", [])):
+        if event.get("action") not in {"exit_long", "exit_short"}:
+            continue
+        net_pnl = event.get("netRealizedPnlUsdt")
+        if net_pnl in (None, ""):
+            net_pnl = event.get("realizedPnlUsdt")
+        if net_pnl in (None, ""):
+            break
+        value = Decimal(str(net_pnl))
+        if value < 0:
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def evaluate_account_circuit_breaker(
+    *,
+    config: BotConfig,
+    state: dict[str, Any],
+    account_snapshot: dict[str, Any] | None,
+    equity_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    now = time.time()
+    current_equity = extract_account_equity(account_snapshot)
+    risk_state = state.setdefault("riskState", {})
+    stored = risk_state.get("accountCircuitBreaker")
+    if not isinstance(stored, dict):
+        stored = {}
+
+    day_start = local_day_start_timestamp(now)
+    day_open_equity = None
+    for point in equity_history:
+        if not isinstance(point, dict):
+            continue
+        timestamp = float(point.get("timestamp", 0) or 0)
+        if timestamp < day_start:
+            continue
+        try:
+            day_open_equity = Decimal(str(point.get("equityUsdt", "0")))
+        except Exception:
+            day_open_equity = None
+        break
+    if day_open_equity in (None, Decimal("0")):
+        day_open_equity = current_equity
+
+    daily_net_realized = Decimal("0")
+    for event in state.get("history", []):
+        if event.get("action") not in {"exit_long", "exit_short"}:
+            continue
+        timestamp = float(event.get("timestamp", 0) or 0)
+        if timestamp < day_start:
+            continue
+        net_pnl = event.get("netRealizedPnlUsdt")
+        if net_pnl in (None, ""):
+            net_pnl = event.get("realizedPnlUsdt")
+        if net_pnl in (None, ""):
+            continue
+        daily_net_realized += Decimal(str(net_pnl))
+
+    daily_loss_pct = None
+    if (
+        day_open_equity not in (None, Decimal("0"))
+        and daily_net_realized < Decimal("0")
+    ):
+        daily_loss_pct = (abs(daily_net_realized) / day_open_equity) * Decimal("100")
+
+    peak_equity = None
+    current_drawdown_pct = None
+    if equity_history:
+        for point in equity_history:
+            if not isinstance(point, dict):
+                continue
+            try:
+                equity = Decimal(str(point.get("equityUsdt", "0")))
+            except Exception:
+                continue
+            if peak_equity is None or equity > peak_equity:
+                peak_equity = equity
+        if (
+            current_equity is not None
+            and peak_equity is not None
+            and peak_equity > Decimal("0")
+        ):
+            current_drawdown_pct = ((peak_equity - current_equity) / peak_equity) * Decimal("100")
+
+    consecutive_losses = recent_consecutive_losses(state)
+    trigger_reasons: list[str] = []
+    if (
+        daily_loss_pct is not None
+        and daily_loss_pct >= Decimal(str(config.daily_loss_pause_pct))
+    ):
+        trigger_reasons.append("daily_loss")
+    if (
+        config.max_consecutive_losses > 0
+        and consecutive_losses >= int(config.max_consecutive_losses)
+    ):
+        trigger_reasons.append("consecutive_losses")
+    if (
+        current_drawdown_pct is not None
+        and current_drawdown_pct >= Decimal(str(config.max_account_drawdown_pct))
+    ):
+        trigger_reasons.append("account_drawdown")
+
+    until_ts = float(stored.get("until", 0) or 0)
+    is_still_paused = until_ts > now
+    just_triggered = False
+    if config.enable_account_circuit_breaker and trigger_reasons:
+        candidate_until = now + max(0, int(config.circuit_breaker_cooldown_minutes)) * 60
+        if candidate_until > until_ts:
+            until_ts = candidate_until
+        is_still_paused = True
+        just_triggered = True
+    elif not config.enable_account_circuit_breaker:
+        until_ts = 0.0
+        is_still_paused = False
+
+    result = {
+        "enabled": bool(config.enable_account_circuit_breaker),
+        "active": bool(config.enable_account_circuit_breaker and is_still_paused),
+        "until": until_ts if is_still_paused else None,
+        "reasons": trigger_reasons or stored.get("reasons") or [],
+        "dailyNetRealizedUsdt": format_decimal_value(daily_net_realized),
+        "dailyLossPct": format_decimal_value(daily_loss_pct),
+        "dayOpenEquityUsdt": format_decimal_value(day_open_equity),
+        "currentEquityUsdt": format_decimal_value(current_equity),
+        "peakEquityUsdt": format_decimal_value(peak_equity),
+        "currentDrawdownPct": format_decimal_value(current_drawdown_pct),
+        "consecutiveLosses": consecutive_losses,
+        "cooldownMinutes": int(config.circuit_breaker_cooldown_minutes),
+        "justTriggered": just_triggered,
+        "updatedAt": now,
+    }
+    risk_state["accountCircuitBreaker"] = result
+    return result
 
 
 def calculate_stop_loss_price(
@@ -1768,6 +2253,53 @@ def pearson_corr(xs: list[float], ys: list[float]) -> float | None:
     return numerator / (denom_x * denom_y)
 
 
+def summarize_correlated_positions(
+    *,
+    broker: BrokerAdapter,
+    state: dict[str, Any],
+    side: str,
+    contract_symbol: str,
+    config: BotConfig,
+) -> dict[str, Any]:
+    candidate_klines = broker.get_klines(
+        contract_symbol,
+        config.correlation_interval,
+        max(3, config.correlation_lookback_bars),
+    )
+    candidate_returns = returns_from_closes(kline_closes(candidate_klines))
+    matches: list[dict[str, Any]] = []
+    strongest_match: dict[str, Any] | None = None
+    for existing_position in state.get("positions", {}).values():
+        if side_from_position(existing_position) != side:
+            continue
+        existing_symbol = existing_position.get("contractSymbol")
+        if not existing_symbol or existing_symbol == contract_symbol:
+            continue
+        existing_klines = broker.get_klines(
+            existing_symbol,
+            config.correlation_interval,
+            max(3, config.correlation_lookback_bars),
+        )
+        corr = pearson_corr(
+            candidate_returns,
+            returns_from_closes(kline_closes(existing_klines)),
+        )
+        if corr is None:
+            continue
+        if (
+            strongest_match is None
+            or abs(corr) > abs(float(strongest_match["correlation"]))
+        ):
+            strongest_match = {"symbol": existing_symbol, "correlation": corr}
+        if abs(corr) >= config.correlation_threshold:
+            matches.append({"symbol": existing_symbol, "correlation": corr})
+    return {
+        "strongest": strongest_match,
+        "matches": matches,
+        "matchCount": len(matches),
+    }
+
+
 def current_margin_usage_pct(account_snapshot: dict[str, Any] | None) -> Decimal | None:
     if not account_snapshot:
         return None
@@ -1909,6 +2441,7 @@ def update_position_stop_loss_state(
         position["stopLossStatus"] = "disabled"
         position["stopLossPrice"] = None
         position["stopLossOrderId"] = None
+        position["stopLossMode"] = "disabled"
         position["stopLossUpdatedAt"] = time.time()
         return
 
@@ -1923,6 +2456,9 @@ def update_position_stop_loss_state(
     )
     position["stopLossOrderId"] = (
         stop_loss_result.get("orderId") if stop_loss_result else None
+    )
+    position["stopLossMode"] = (
+        stop_loss_result.get("mode") if stop_loss_result else "fixed"
     )
     position["stopLossUpdatedAt"] = time.time()
 
@@ -1943,8 +2479,15 @@ def build_entry_audit_record(
     trend_signal: dict[str, Any] | None,
     correlated_symbol: str | None,
     correlated_value: float | None,
+    correlated_match_count: int,
+    account_equity: Decimal | None,
+    sizing_result: dict[str, Decimal | str | None],
+    risk_summary: dict[str, Decimal],
+    circuit_breaker: dict[str, Any] | None,
 ) -> dict[str, Any]:
     side_limit = config.max_long_open_positions if side == LONG else config.max_short_open_positions
+    estimated_entry_risk = sizing_result.get("estimatedRiskUsdt")
+    side_open_risk = risk_summary["longRiskUsdt"] if side == LONG else risk_summary["shortRiskUsdt"]
     return {
         "version": 1,
         "candidateCount": candidate_count,
@@ -1979,6 +2522,7 @@ def build_entry_audit_record(
         "correlationPassed": correlated_symbol is None,
         "correlatedSymbol": correlated_symbol,
         "correlation": round(correlated_value, 4) if correlated_value is not None else None,
+        "correlatedMatchCount": correlated_match_count,
         "correlationThreshold": config.correlation_threshold,
         "openedBefore": opened_before,
         "cycleLimit": int(config.max_new_positions_per_cycle),
@@ -1996,6 +2540,21 @@ def build_entry_audit_record(
         "stopLossConfigured": None,
         "stopLossStatus": None,
         "stopLossPrice": None,
+        "accountEquityUsdt": format_decimal_value(account_equity),
+        "sizingMode": sizing_result.get("mode"),
+        "plannedNotionalUsdt": format_decimal_value(sizing_result.get("notionalUsdt")),
+        "riskBudgetUsdt": format_decimal_value(sizing_result.get("riskBudgetUsdt")),
+        "estimatedEntryRiskUsdt": format_decimal_value(estimated_entry_risk),
+        "portfolioRiskCapEnabled": bool(config.enable_portfolio_risk_cap),
+        "openSideRiskUsdt": format_decimal_value(side_open_risk),
+        "openTotalRiskUsdt": format_decimal_value(risk_summary["totalRiskUsdt"]),
+        "maxSideOpenRiskPct": format_decimal_value(config.max_side_open_risk_pct),
+        "maxTotalOpenRiskPct": format_decimal_value(config.max_total_open_risk_pct),
+        "maxCorrelatedPositionsPerSide": int(config.max_correlated_positions_per_side),
+        "circuitBreakerActive": bool(circuit_breaker and circuit_breaker.get("active")),
+        "circuitBreakerReasons": (
+            list(circuit_breaker.get("reasons") or []) if circuit_breaker else []
+        ),
     }
 
 
@@ -2047,6 +2606,19 @@ def build_exit_audit_record(
         "stopLossConfigured": position.get("stopLossConfigured"),
         "configuredStopLossPrice": position.get("stopLossPrice"),
         "stopLossStatus": position.get("stopLossStatus"),
+        "stopLossMode": position.get("stopLossMode"),
+        "breakevenEnabled": bool(config.enable_breakeven_stop),
+        "breakevenTriggerPct": format_decimal_value(config.breakeven_trigger_pct),
+        "breakevenBufferPct": format_decimal_value(config.breakeven_buffer_pct),
+        "breakevenActivatedAt": position.get("breakevenActivatedAt"),
+        "partialTakeProfitEnabled": bool(config.enable_partial_take_profit),
+        "partialTakeProfitTriggerPct": format_decimal_value(
+            config.partial_take_profit_trigger_pct
+        ),
+        "partialTakeProfitCloseRatio": format_decimal_value(
+            config.partial_take_profit_close_ratio
+        ),
+        "partialTakeProfitDoneAt": position.get("partialTakeProfitDoneAt"),
         "signalLostRounds": int(position.get("signalLostRounds", 0) or 0),
         "signalLostConfirmRounds": int(config.signal_lost_exit_confirm_rounds),
         "exchangePositionMissing": reason == "exchange_position_missing",
@@ -2117,6 +2689,10 @@ def build_exit_record(
         "entryNotionalUsdt": position.get("notionalUsdt"),
         "returnBasisUsdt": position.get("returnBasisUsdt"),
         "openedAt": position.get("openedAt"),
+        "entryReason": position.get("entryReason"),
+        "entrySizingMode": position.get("entrySizingMode"),
+        "plannedRiskUsdt": position.get("plannedRiskUsdt"),
+        "entryScoreLabel": position.get("scoreLabel"),
         "realizedPnlUsdt": str(realized_pnl) if realized_pnl is not None else None,
         "estimatedFeeUsdt": str(estimated_fee) if estimated_fee is not None else None,
         "netRealizedPnlUsdt": str(net_realized_pnl) if net_realized_pnl is not None else None,
@@ -2127,9 +2703,56 @@ def build_exit_record(
         "minPnlAt": position.get("minPnlAt"),
         "lastPnlPct": position.get("lastPnlPct"),
         "lastPnlCheckAt": position.get("lastPnlCheckAt"),
+        "stopLossMode": position.get("stopLossMode"),
+        "partialTakeProfitDoneAt": position.get("partialTakeProfitDoneAt"),
+        "breakevenActivatedAt": position.get("breakevenActivatedAt"),
         "auditVersion": 1 if audit else None,
         "audit": audit,
     }
+
+
+def build_partial_exit_record(
+    *,
+    asset: str,
+    side: str,
+    strategy_id: str,
+    position: dict[str, Any],
+    close_result: dict[str, Any],
+    reason: str,
+    fee_rate: Decimal,
+    close_ratio: Decimal,
+    audit: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    partial_position = dict(position)
+    total_quantity = infer_position_quantity(position)
+    if total_quantity is not None and total_quantity > Decimal("0"):
+        exit_qty = decimal_or_none(close_result.get("exitQty"))
+        if exit_qty is None:
+            exit_qty = total_quantity * close_ratio
+        actual_ratio = clamp_decimal(exit_qty / total_quantity, min_value=Decimal("0"), max_value=Decimal("1"))
+    else:
+        actual_ratio = close_ratio
+    for key in ("quantity", "notionalUsdt", "returnBasisUsdt"):
+        value = decimal_or_none(position.get(key))
+        if value is None:
+            continue
+        partial_position[key] = format_decimal_value(value * actual_ratio)
+    event = build_exit_record(
+        asset=asset,
+        side=side,
+        strategy_id=strategy_id,
+        position=partial_position,
+        close_result=close_result,
+        reason=reason,
+        fee_rate=fee_rate,
+        audit=audit,
+    )
+    event["action"] = partial_exit_action(side)
+    event["isPartial"] = True
+    event["closeRatio"] = format_decimal_value(actual_ratio)
+    event["remainingQuantity"] = close_result.get("remainingQuantity")
+    event["remainingNotionalUsdt"] = close_result.get("remainingNotionalUsdt")
+    return event
 
 
 def write_snapshot(path: Path, candidates: list[dict[str, Any]]) -> None:
@@ -2305,6 +2928,12 @@ def is_close_result_success(close_result: dict[str, Any]) -> bool:
     return bool(close_result.get("confirmedClosed"))
 
 
+def is_reduce_result_success(close_result: dict[str, Any]) -> bool:
+    if close_result.get("status") == "CLOSE_REJECTED":
+        return False
+    return close_result.get("orderId") not in (None, "")
+
+
 def build_close_failed_decision(
     *,
     position: dict[str, Any],
@@ -2335,6 +2964,8 @@ def process_strategy(
     candidates: list[dict[str, Any]],
     suspend_signal_lost_exit: bool = False,
     previous_snapshot: list[dict[str, Any]] | None = None,
+    account_snapshot: dict[str, Any] | None = None,
+    circuit_breaker: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     strategy_config = get_strategy_config(config.strategy_config_file, strategy_id)
     if not strategy_config.get("enabled", True):
@@ -2380,7 +3011,7 @@ def process_strategy(
     decisions: list[dict[str, Any]] = []
     opened = 0
     closed = 0
-    account_snapshot_cache: dict[str, Any] | None = None
+    account_snapshot_cache: dict[str, Any] | None = account_snapshot
 
     current_positions = {
         key: position
@@ -2462,6 +3093,160 @@ def process_strategy(
             position,
             calculate_unrealized_pnl_pct(position, mark_price_raw),
         )
+        if should_activate_breakeven_stop(
+            config=config,
+            position=position,
+            current_pnl_pct=tracking["current"],
+        ):
+            breakeven_price = calculate_breakeven_stop_price(
+                position,
+                Decimal(str(config.breakeven_buffer_pct)),
+            )
+            if breakeven_price is not None:
+                position["stopLossOverridePrice"] = format_decimal_value(breakeven_price)
+                position["stopLossMode"] = "breakeven"
+                position["breakevenActivatedAt"] = time.time()
+                position["breakevenTriggerPct"] = format_decimal_value(
+                    config.breakeven_trigger_pct
+                )
+                position["breakevenBufferPct"] = format_decimal_value(
+                    config.breakeven_buffer_pct
+                )
+
+        if should_trigger_partial_take_profit(
+            config=config,
+            position=position,
+            current_pnl_pct=tracking["current"],
+        ):
+            partial_ratio = Decimal(str(config.partial_take_profit_close_ratio))
+            partial_audit = build_exit_audit_record(
+                config=config,
+                position=position,
+                reason="partial_take_profit",
+                tracking=tracking,
+            )
+            partial_result = broker.close_position(
+                contract_symbol=position["contractSymbol"],
+                asset=position["asset"],
+                side=side,
+                position=position,
+                dry_run=config.dry_run,
+                close_ratio=float(partial_ratio),
+            )
+            if not is_reduce_result_success(partial_result):
+                decisions.append(
+                    build_close_failed_decision(
+                        position=position,
+                        side=side,
+                        attempted_reason="partial_take_profit",
+                        close_result=partial_result,
+                    )
+                )
+            else:
+                position["partialTakeProfitDoneAt"] = time.time()
+                position["partialTakeProfitCloseRatio"] = format_decimal_value(partial_ratio)
+                partial_event = build_partial_exit_record(
+                    asset=position["asset"],
+                    side=side,
+                    strategy_id=strategy_id,
+                    position=position,
+                    close_result=partial_result,
+                    reason="partial_take_profit",
+                    fee_rate=fee_rate,
+                    close_ratio=partial_ratio,
+                    audit=partial_audit,
+                )
+                state.setdefault("history", []).append(partial_event)
+                if broker.name == "binance_testnet" and not config.dry_run:
+                    live_after = broker.get_live_position(position["contractSymbol"], side)
+                    if live_after is None:
+                        state.get("positions", {}).pop(key, None)
+                        decisions.append(
+                            {
+                                "asset": position["asset"],
+                                "side": side,
+                                "action": partial_exit_action(side),
+                                "contractSymbol": position["contractSymbol"],
+                                "status": partial_result["status"],
+                                "reason": "partial_take_profit",
+                                "realizedPnlUsdt": partial_event["realizedPnlUsdt"],
+                                "netRealizedPnlUsdt": partial_event["netRealizedPnlUsdt"],
+                                "closeRatio": partial_event["closeRatio"],
+                                "remainingQuantity": None,
+                            }
+                        )
+                        continue
+                    live_amount = abs(Decimal(str(live_after.get("positionAmt", "0"))))
+                    if live_amount == Decimal("0"):
+                        state.get("positions", {}).pop(key, None)
+                        continue
+                    api_return_basis = extract_api_return_basis(live_after)
+                    position["quantity"] = format_decimal_value(live_amount)
+                    position["notionalUsdt"] = format_decimal_value(
+                        abs(Decimal(str(live_after.get("notional", "0"))))
+                    )
+                    position["entryPrice"] = live_after.get("entryPrice") or position.get("entryPrice")
+                    position["unRealizedProfit"] = live_after.get("unRealizedProfit")
+                    position["positionInitialMargin"] = live_after.get("positionInitialMargin")
+                    position["initialMargin"] = live_after.get("initialMargin")
+                    position["isolatedWallet"] = live_after.get("isolatedWallet")
+                    position["isolatedMargin"] = live_after.get("isolatedMargin")
+                    if api_return_basis is not None:
+                        position["returnBasisUsdt"] = str(api_return_basis)
+                else:
+                    remaining_ratio = Decimal("1") - partial_ratio
+                    for key_name in ("quantity", "notionalUsdt", "returnBasisUsdt"):
+                        current_value = decimal_or_none(position.get(key_name))
+                        if current_value is not None:
+                            position[key_name] = format_decimal_value(
+                                current_value * remaining_ratio
+                            )
+                if config.enable_stop_loss:
+                    try:
+                        stop_loss_result = broker.ensure_stop_loss(
+                            contract_symbol=position["contractSymbol"],
+                            side=side,
+                            position=position,
+                            stop_loss_pct=config.stop_loss_pct,
+                            dry_run=config.dry_run,
+                        )
+                    except Exception as exc:
+                        logging.exception(
+                            "partial_take_profit_stop_loss_refresh_failed asset=%s symbol=%s side=%s error=%s",
+                            position["asset"],
+                            position["contractSymbol"],
+                            side,
+                            exc,
+                        )
+                        stop_loss_result = {
+                            "orderId": None,
+                            "status": "STOP_LOSS_SETUP_FAILED",
+                            "configured": False,
+                            "stopPrice": position.get("stopLossPrice"),
+                            "stopLossPct": format_decimal_value(config.stop_loss_pct),
+                            "mode": position.get("stopLossMode") or "fixed",
+                        }
+                    update_position_stop_loss_state(
+                        position=position,
+                        config=config,
+                        stop_loss_result=stop_loss_result,
+                    )
+                decisions.append(
+                    {
+                        "asset": position["asset"],
+                        "side": side,
+                        "action": partial_exit_action(side),
+                        "contractSymbol": position["contractSymbol"],
+                        "status": partial_result["status"],
+                        "reason": "partial_take_profit",
+                        "realizedPnlUsdt": partial_event["realizedPnlUsdt"],
+                        "netRealizedPnlUsdt": partial_event["netRealizedPnlUsdt"],
+                        "closeRatio": partial_event["closeRatio"],
+                        "remainingQuantity": partial_result.get("remainingQuantity"),
+                    }
+                )
+                continue
+
         if config.enable_stop_loss:
             stop_loss_source_position = dict(position)
             if live_position is not None:
@@ -2848,6 +3633,10 @@ def process_strategy(
         trend_signal = None
         correlated_symbol = None
         correlated_value = None
+        correlated_match_count = 0
+        account_equity = None
+        sizing_result: dict[str, Decimal | str | None] | None = None
+        risk_summary = calculate_open_risk_summary(state, config)
 
         if broker.has_open_position(state, asset, side):
             key = position_key(asset, side)
@@ -2919,6 +3708,19 @@ def process_strategy(
 
         if is_in_cooldown(state, asset, side, config.cooldown_minutes):
             decisions.append({"asset": asset, "side": side, "action": "skip", "reason": "cooldown"})
+            continue
+
+        if circuit_breaker and circuit_breaker.get("active"):
+            decisions.append(
+                {
+                    "asset": asset,
+                    "side": side,
+                    "action": "skip",
+                    "reason": "account_circuit_breaker",
+                    "circuitBreakerUntil": circuit_breaker.get("until"),
+                    "circuitBreakerReasons": circuit_breaker.get("reasons") or [],
+                }
+            )
             continue
 
         margin_modes = broker.supported_margin_modes(contract["symbol"])
@@ -3053,45 +3855,57 @@ def process_strategy(
                 )
                 continue
 
-        if config.enable_correlation_filter:
-            candidate_klines = broker.get_klines(
-                contract["symbol"],
-                config.correlation_interval,
-                max(3, config.correlation_lookback_bars),
+        if (
+            config.enable_correlation_filter
+            or (
+                config.enable_portfolio_risk_cap
+                and config.max_correlated_positions_per_side > 0
             )
-            candidate_returns = returns_from_closes(kline_closes(candidate_klines))
-            correlated_symbol = None
-            correlated_value = None
-            for existing_position in state.get("positions", {}).values():
-                if side_from_position(existing_position) != side:
-                    continue
-                existing_symbol = existing_position.get("contractSymbol")
-                if not existing_symbol or existing_symbol == contract["symbol"]:
-                    continue
-                existing_klines = broker.get_klines(
-                    existing_symbol,
-                    config.correlation_interval,
-                    max(3, config.correlation_lookback_bars),
-                )
-                corr = pearson_corr(
-                    candidate_returns,
-                    returns_from_closes(kline_closes(existing_klines)),
-                )
-                if corr is None:
-                    continue
-                if abs(corr) >= config.correlation_threshold:
-                    correlated_symbol = existing_symbol
-                    correlated_value = corr
-                    break
-            if correlated_symbol is not None:
+        ):
+            correlation_summary = summarize_correlated_positions(
+                broker=broker,
+                state=state,
+                side=side,
+                contract_symbol=contract["symbol"],
+                config=config,
+            )
+            strongest_correlation = correlation_summary.get("strongest") or {}
+            correlated_symbol = strongest_correlation.get("symbol")
+            correlated_value = strongest_correlation.get("correlation")
+            correlated_match_count = int(correlation_summary.get("matchCount", 0) or 0)
+            correlated_matches = correlation_summary.get("matches") or []
+            first_match = correlated_matches[0] if correlated_matches else None
+            if config.enable_correlation_filter and first_match is not None:
                 decisions.append(
                     {
                         "asset": asset,
                         "side": side,
                         "action": "skip",
                         "reason": "correlated_with_existing",
+                        "correlatedSymbol": first_match.get("symbol"),
+                        "correlation": round(first_match.get("correlation"), 4),
+                    }
+                )
+                continue
+            if (
+                config.enable_portfolio_risk_cap
+                and config.max_correlated_positions_per_side > 0
+                and correlated_match_count >= int(config.max_correlated_positions_per_side)
+            ):
+                decisions.append(
+                    {
+                        "asset": asset,
+                        "side": side,
+                        "action": "skip",
+                        "reason": "correlated_cluster_limit",
+                        "correlatedMatchCount": correlated_match_count,
+                        "maxCorrelatedPositionsPerSide": int(
+                            config.max_correlated_positions_per_side
+                        ),
                         "correlatedSymbol": correlated_symbol,
-                        "correlation": round(correlated_value, 4),
+                        "correlation": round(correlated_value, 4)
+                        if correlated_value is not None
+                        else None,
                     }
                 )
                 continue
@@ -3111,6 +3925,58 @@ def process_strategy(
             decisions.append({"asset": asset, "side": side, "action": "skip", "reason": "portfolio_limit"})
             continue
 
+        if (
+            account_snapshot_cache is None
+            and (
+                config.enable_risk_position_sizing
+                or config.enable_portfolio_risk_cap
+            )
+        ):
+            account_snapshot_cache = broker.get_account_snapshot()
+        account_equity = extract_account_equity(account_snapshot_cache)
+        sizing_result = resolve_entry_notional_usdt(
+            config=config,
+            account_equity=account_equity,
+        )
+        entry_notional = Decimal(str(sizing_result["notionalUsdt"]))
+        estimated_entry_risk = sizing_result.get("estimatedRiskUsdt")
+        if (
+            config.enable_portfolio_risk_cap
+            and account_equity is not None
+            and account_equity > Decimal("0")
+            and estimated_entry_risk is not None
+        ):
+            side_risk = risk_summary["longRiskUsdt"] if side == LONG else risk_summary["shortRiskUsdt"]
+            projected_side_risk_pct = ((side_risk + estimated_entry_risk) / account_equity) * Decimal("100")
+            projected_total_risk_pct = (
+                (risk_summary["totalRiskUsdt"] + estimated_entry_risk)
+                / account_equity
+            ) * Decimal("100")
+            if projected_side_risk_pct > Decimal(str(config.max_side_open_risk_pct)):
+                decisions.append(
+                    {
+                        "asset": asset,
+                        "side": side,
+                        "action": "skip",
+                        "reason": "side_risk_limit",
+                        "projectedSideRiskPct": format(projected_side_risk_pct, "f"),
+                        "maxSideOpenRiskPct": format_decimal_value(config.max_side_open_risk_pct),
+                    }
+                )
+                continue
+            if projected_total_risk_pct > Decimal(str(config.max_total_open_risk_pct)):
+                decisions.append(
+                    {
+                        "asset": asset,
+                        "side": side,
+                        "action": "skip",
+                        "reason": "portfolio_risk_limit",
+                        "projectedTotalRiskPct": format(projected_total_risk_pct, "f"),
+                        "maxTotalOpenRiskPct": format_decimal_value(config.max_total_open_risk_pct),
+                    }
+                )
+                continue
+
         entry_audit = build_entry_audit_record(
             config=config,
             state=state,
@@ -3126,6 +3992,11 @@ def process_strategy(
             trend_signal=trend_signal,
             correlated_symbol=correlated_symbol,
             correlated_value=correlated_value,
+            correlated_match_count=correlated_match_count,
+            account_equity=account_equity,
+            sizing_result=sizing_result,
+            risk_summary=risk_summary,
+            circuit_breaker=circuit_breaker,
         )
 
         metadata = {
@@ -3139,13 +4010,16 @@ def process_strategy(
             "requiredMarginMode": config.required_margin_mode,
             "leverage": config.leverage,
             "side": side,
+            "sizingMode": sizing_result.get("mode"),
+            "plannedNotionalUsdt": format_decimal_value(entry_notional),
+            "estimatedEntryRiskUsdt": format_decimal_value(estimated_entry_risk),
         }
         try:
             if side == LONG:
                 order_result = broker.place_long_market_order(
                     contract_symbol=contract["symbol"],
                     asset=asset,
-                    notional_usdt=config.usdt_per_trade,
+                    notional_usdt=float(entry_notional),
                     metadata=metadata,
                     dry_run=config.dry_run,
                 )
@@ -3153,7 +4027,7 @@ def process_strategy(
                 order_result = broker.place_short_market_order(
                     contract_symbol=contract["symbol"],
                     asset=asset,
-                    notional_usdt=config.usdt_per_trade,
+                    notional_usdt=float(entry_notional),
                     metadata=metadata,
                     dry_run=config.dry_run,
                 )
@@ -3185,11 +4059,16 @@ def process_strategy(
             "entryPrice": order_result.get("entryPrice"),
             "rank": item.get("rank"),
             "score": get_score(item),
-            "notionalUsdt": order_result.get("notionalUsdt", config.usdt_per_trade),
+            "scoreLabel": get_score_label(item),
+            "notionalUsdt": order_result.get("notionalUsdt", format_decimal_value(entry_notional)),
             "dryRun": config.dry_run,
             "requiredMarginMode": config.required_margin_mode,
             "leverage": config.leverage,
             "returnBasisUsdt": None,
+            "entryReason": signal_enter_reason(side),
+            "entrySizingMode": sizing_result.get("mode"),
+            "plannedRiskUsdt": format_decimal_value(estimated_entry_risk),
+            "riskBudgetUsdt": format_decimal_value(sizing_result.get("riskBudgetUsdt")),
             "maxProfitPct": "0",
             "minPnlPct": "0",
             "lastPnlPct": "0",
@@ -3250,6 +4129,10 @@ def process_strategy(
                 "reason": signal_enter_reason(side),
                 "entryPrice": order_result.get("entryPrice"),
                 "quantity": order_result.get("quantity"),
+                "notionalUsdt": opened_position.get("notionalUsdt"),
+                "scoreLabel": opened_position.get("scoreLabel"),
+                "entrySizingMode": opened_position.get("entrySizingMode"),
+                "plannedRiskUsdt": opened_position.get("plannedRiskUsdt"),
                 "stopLossPrice": opened_position.get("stopLossPrice"),
                 "stopLossStatus": opened_position.get("stopLossStatus"),
                 "auditVersion": 1,
@@ -3265,6 +4148,9 @@ def process_strategy(
                 "status": order_result["status"],
                 "score": get_score(item),
                 "quantity": order_result.get("quantity"),
+                "notionalUsdt": opened_position.get("notionalUsdt"),
+                "sizingMode": sizing_result.get("mode"),
+                "estimatedEntryRiskUsdt": format_decimal_value(estimated_entry_risk),
                 "stopLossPrice": opened_position.get("stopLossPrice"),
                 "stopLossStatus": opened_position.get("stopLossStatus"),
             }
@@ -3290,7 +4176,7 @@ def process_strategy(
             "name": strategy_config.get("name", strategy_id),
             "category": strategy_config.get("category"),
             "enabled": True,
-            "status": "ok",
+            "status": "guarded" if circuit_breaker and circuit_breaker.get("active") else "ok",
             "side": side,
             "candidateCount": len(candidates),
             "openedCount": opened,
@@ -3299,6 +4185,7 @@ def process_strategy(
             "closedLossCount": closed_loss_count,
             "closedFlatCount": closed_flat_count,
             "realizedPnlUsdt": str(realized_pnl_total),
+            "accountCircuitBreaker": circuit_breaker or {},
             "latestDecisions": decisions,
         },
     )
@@ -3313,6 +4200,7 @@ def process_strategy(
         "closedLossCount": closed_loss_count,
         "closedFlatCount": closed_flat_count,
         "realizedPnlUsdt": str(realized_pnl_total),
+        "accountCircuitBreaker": circuit_breaker or {},
         "decisions": decisions,
     }
 
@@ -3394,6 +4282,28 @@ def run_once(config: BotConfig) -> dict[str, Any]:
     else:
         write_snapshot(config.negative_snapshot_file, negative_candidates)
 
+    try:
+        account_snapshot = broker.get_account_snapshot()
+    except Exception as exc:
+        logging.warning("account_snapshot_failed_for_risk_controls error=%s", exc)
+        account_snapshot = None
+    equity_history = record_account_equity_snapshot(
+        config.equity_history_file,
+        account_snapshot,
+    )
+    circuit_breaker = evaluate_account_circuit_breaker(
+        config=config,
+        state=state,
+        account_snapshot=account_snapshot,
+        equity_history=equity_history,
+    )
+    if circuit_breaker.get("active"):
+        logging.warning(
+            "account_circuit_breaker_active reasons=%s until=%s",
+            circuit_breaker.get("reasons"),
+            circuit_breaker.get("until"),
+        )
+
     long_result: dict[str, Any] | None = None
     short_result: dict[str, Any] | None = None
     try:
@@ -3407,6 +4317,8 @@ def run_once(config: BotConfig) -> dict[str, Any]:
             candidates=positive_candidates,
             suspend_signal_lost_exit=suspend_long_signal_lost_exit,
             previous_snapshot=previous_positive_snapshot,
+            account_snapshot=account_snapshot,
+            circuit_breaker=circuit_breaker,
         )
         state_store.save(state)
 
@@ -3420,6 +4332,8 @@ def run_once(config: BotConfig) -> dict[str, Any]:
             candidates=negative_candidates,
             suspend_signal_lost_exit=suspend_short_signal_lost_exit,
             previous_snapshot=previous_negative_snapshot,
+            account_snapshot=account_snapshot,
+            circuit_breaker=circuit_breaker,
         )
         state_store.save(state)
     except Exception:
@@ -3437,6 +4351,7 @@ def run_once(config: BotConfig) -> dict[str, Any]:
         },
         "openedCount": long_result["openedCount"] + short_result["openedCount"],
         "closedCount": long_result["closedCount"] + short_result["closedCount"],
+        "accountCircuitBreaker": circuit_breaker,
     }
 
 
@@ -3516,6 +4431,35 @@ def build_config(workdir: Path) -> BotConfig:
             os.getenv("SIGNAL_LOST_EXIT_CONFIRM_ROUNDS", "3")
         ),
         estimated_taker_fee_rate=float(os.getenv("ESTIMATED_TAKER_FEE_RATE", "0.0005")),
+        enable_account_circuit_breaker=get_env_bool("ENABLE_ACCOUNT_CIRCUIT_BREAKER", True),
+        daily_loss_pause_pct=float(os.getenv("DAILY_LOSS_PAUSE_PCT", "4")),
+        max_consecutive_losses=int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4")),
+        max_account_drawdown_pct=float(os.getenv("MAX_ACCOUNT_DRAWDOWN_PCT", "12")),
+        circuit_breaker_cooldown_minutes=int(
+            os.getenv("CIRCUIT_BREAKER_COOLDOWN_MINUTES", "120")
+        ),
+        enable_risk_position_sizing=get_env_bool("ENABLE_RISK_POSITION_SIZING", True),
+        risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.6")),
+        min_notional_per_trade_usdt=float(os.getenv("MIN_NOTIONAL_PER_TRADE_USDT", "100")),
+        max_notional_per_trade_usdt=float(
+            os.getenv("MAX_NOTIONAL_PER_TRADE_USDT", os.getenv("USDT_PER_TRADE", "500"))
+        ),
+        enable_portfolio_risk_cap=get_env_bool("ENABLE_PORTFOLIO_RISK_CAP", True),
+        max_side_open_risk_pct=float(os.getenv("MAX_SIDE_OPEN_RISK_PCT", "3")),
+        max_total_open_risk_pct=float(os.getenv("MAX_TOTAL_OPEN_RISK_PCT", "5")),
+        max_correlated_positions_per_side=int(
+            os.getenv("MAX_CORRELATED_POSITIONS_PER_SIDE", "2")
+        ),
+        enable_breakeven_stop=get_env_bool("ENABLE_BREAKEVEN_STOP", True),
+        breakeven_trigger_pct=float(os.getenv("BREAKEVEN_TRIGGER_PCT", "12")),
+        breakeven_buffer_pct=float(os.getenv("BREAKEVEN_BUFFER_PCT", "1")),
+        enable_partial_take_profit=get_env_bool("ENABLE_PARTIAL_TAKE_PROFIT", True),
+        partial_take_profit_trigger_pct=float(
+            os.getenv("PARTIAL_TAKE_PROFIT_TRIGGER_PCT", "18")
+        ),
+        partial_take_profit_close_ratio=float(
+            os.getenv("PARTIAL_TAKE_PROFIT_CLOSE_RATIO", "0.5")
+        ),
         strategy_config_file=workdir / STRATEGY_CONFIG_FILE,
         strategy_status_file=workdir / STRATEGY_STATUS_FILE,
         state_file=workdir / os.getenv("STATE_FILE", "runtime/state.json"),
@@ -3526,6 +4470,8 @@ def build_config(workdir: Path) -> BotConfig:
             "NEGATIVE_SNAPSHOT_FILE", "runtime/strong_negative_snapshot.json"
         ),
         log_file=workdir / os.getenv("LOG_FILE", "runtime/bot.log"),
+        equity_history_file=workdir
+        / os.getenv("EQUITY_HISTORY_FILE", "runtime/account_equity_history.json"),
     )
 
 
