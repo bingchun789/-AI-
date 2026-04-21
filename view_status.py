@@ -1410,6 +1410,31 @@ def _history_cache_path(workdir: Path) -> Path:
     return workdir / "runtime" / "history_cache.json"
 
 
+def _reset_marker_path(workdir: Path) -> Path:
+    return workdir / "runtime" / "reset_marker.json"
+
+
+def _reset_cutoff_ms(workdir: Path) -> int | None:
+    marker = _load_json(_reset_marker_path(workdir), {})
+    if not isinstance(marker, dict):
+        return None
+    reset_at_ms = marker.get("resetAtMs")
+    if reset_at_ms not in (None, ""):
+        try:
+            value = int(float(reset_at_ms))
+            return value if value > 0 else None
+        except Exception:
+            pass
+    reset_at = marker.get("resetAt")
+    if reset_at not in (None, ""):
+        try:
+            value = int(float(reset_at) * 1000)
+            return value if value > 0 else None
+        except Exception:
+            pass
+    return None
+
+
 def _load_history_cache(workdir: Path) -> dict[str, Any]:
     payload = _load_json(_history_cache_path(workdir), {})
     return payload if isinstance(payload, dict) else {}
@@ -1458,10 +1483,20 @@ def _merge_force_order_items(
     return ordered[:limit]
 
 
+def _filter_items_after_cutoff(
+    items: list[dict[str, Any]],
+    reset_cutoff_ms: int | None,
+) -> list[dict[str, Any]]:
+    if not reset_cutoff_ms:
+        return items
+    return [item for item in items if _event_time_ms(item) >= reset_cutoff_ms]
+
+
 def _build_cached_force_order_summary(
     workdir: Path,
     broker: Any,
     local_force_summary: dict[str, Any],
+    reset_cutoff_ms: int | None = None,
 ) -> dict[str, Any]:
     cache = _load_history_cache(workdir)
     now = time.time()
@@ -1473,6 +1508,7 @@ def _build_cached_force_order_summary(
     cached_force_items = cache.get("forceOrderItems", [])
     if not isinstance(cached_force_items, list):
         cached_force_items = []
+    cached_force_items = _filter_items_after_cutoff(cached_force_items, reset_cutoff_ms)
 
     if sync_due:
         last_force_sync_ms = int(cache.get("lastForceSyncMs", 0) or 0)
@@ -1481,6 +1517,8 @@ def _build_cached_force_order_summary(
             if last_force_sync_ms > 0
             else now_ms - 30 * 24 * 60 * 60 * 1000
         )
+        if reset_cutoff_ms:
+            start_time_ms = max(start_time_ms, reset_cutoff_ms)
         try:
             api_force_summary = _build_force_order_summary(
                 broker=broker,
@@ -1491,6 +1529,7 @@ def _build_cached_force_order_summary(
                 cached_force_items,
                 api_force_summary.get("items", []),
             )
+            cached_force_items = _filter_items_after_cutoff(cached_force_items, reset_cutoff_ms)
             cache["forceOrderItems"] = cached_force_items
             cache["lastForceSyncMs"] = now_ms
             cache["syncedAt"] = now
@@ -1499,7 +1538,7 @@ def _build_cached_force_order_summary(
             logging.warning("force_order_incremental_sync_failed: %s", exc)
 
     merged_items = _merge_force_order_items(
-        local_force_summary.get("items", []),
+        _filter_items_after_cutoff(local_force_summary.get("items", []), reset_cutoff_ms),
         cached_force_items,
     )
     total_loss = sum(
@@ -1591,9 +1630,12 @@ def _build_recent_closes_from_api(
     broker: Any,
     closed_history: list[dict[str, Any]],
     limit: int | None = 20,
+    reset_cutoff_ms: int | None = None,
 ) -> list[dict[str, Any]]:
     now_ms = int(time.time() * 1000)
     start_time_ms = now_ms - (7 * 24 * 60 * 60 * 1000)
+    if reset_cutoff_ms:
+        start_time_ms = max(start_time_ms, reset_cutoff_ms)
 
     income_rows = _fetch_income_history_chunked(
         broker=broker,
@@ -1773,10 +1815,13 @@ def _build_trade_history_from_api(
     broker: Any,
     positions: list[dict[str, Any]],
     closed_history: list[dict[str, Any]],
+    reset_cutoff_ms: int | None = None,
 ) -> list[dict[str, Any]]:
     """Build a complete order history from the allOrders API endpoint."""
     now_ms = int(time.time() * 1000)
     start_time_ms = now_ms - (30 * 24 * 60 * 60 * 1000)  # 30 days
+    if reset_cutoff_ms:
+        start_time_ms = max(start_time_ms, reset_cutoff_ms)
 
     all_symbols: set[str] = set()
     for pos in positions:
@@ -2145,6 +2190,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
     config = build_config(workdir)
     broker = select_broker_adapter()
     state = migrate_state(_load_json(workdir / "runtime/state.json", {"positions": {}, "history": []}))
+    reset_cutoff_ms = _reset_cutoff_ms(workdir)
     monitor_summary = _load_json(workdir / "runtime/monitor_summary.json", None)
     all_strategy_statuses = _load_json(workdir / "runtime/strategy_statuses.json", {})
     strategy_statuses = {
@@ -2158,6 +2204,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         event
         for event in state.get("history", [])
         if event.get("action") in {"exit_long", "exit_short"}
+        and (not reset_cutoff_ms or _event_time_ms(event) >= reset_cutoff_ms)
     ]
 
     try:
@@ -2261,6 +2308,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             workdir,
             broker,
             local_force_order_summary,
+            reset_cutoff_ms=reset_cutoff_ms,
         )
         if False and force_order_summary.get("count", 0) == 0:
             fallback_force_items = []
@@ -2442,6 +2490,10 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         "recentCloses": recent_closes,
         "tradeHistory": trade_history,
         "forceOrderSummary": force_order_summary,
+        "resetMarker": {
+            "resetAtMs": reset_cutoff_ms,
+            "active": reset_cutoff_ms is not None,
+        },
         "monitorSummary": monitor_summary,
         "unopenedCandidates": unopened_candidates,
         "activeCooldowns": active_cooldowns,
