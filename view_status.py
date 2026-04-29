@@ -589,7 +589,8 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
         "title": "榜单数量开仓",
         "value": (
             f"做多达到 {config.min_long_signal_count_to_open} 个才开多；"
-            f"做空达到 {config.min_short_signal_count_to_open} 个才开空"
+            f"做空达到 {config.min_short_signal_count_to_open} 个才开空；"
+            "达到门槛后连续确认 3 轮才执行"
             if config.enable_signal_count_entry_gate
             else "已关闭"
         ),
@@ -608,7 +609,8 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
         "title": "榜单数量平仓",
         "value": (
             f"做多少于 {config.long_signal_count_to_close_below} 个平全部做多仓；"
-            f"做空少于 {config.short_signal_count_to_close_below} 个平全部做空仓"
+            f"做空少于 {config.short_signal_count_to_close_below} 个平全部做空仓；"
+            "跌破门槛后连续确认 3 轮才执行"
             if config.enable_signal_count_exit
             else "已关闭"
         ),
@@ -1152,6 +1154,16 @@ def _format_unopened_detail(item: dict[str, Any]) -> str | None:
         required_count = item.get("requiredSignalCount")
         if current_count not in (None, "") and required_count not in (None, ""):
             return f"当前强信号 {current_count} 个，榜单数量开仓至少需要 {required_count} 个"
+    if reason == "signal_count_entry_confirming":
+        current_count = item.get("currentSignalCount")
+        required_count = item.get("requiredSignalCount")
+        rounds = item.get("confirmationRounds")
+        required_rounds = item.get("confirmationRequiredRounds")
+        if current_count not in (None, "") and required_count not in (None, ""):
+            return (
+                f"当前强信号 {current_count} 个，已达到开仓门槛 {required_count} 个；"
+                f"确认 {rounds or 0}/{required_rounds or 3} 轮"
+            )
     if reason == "trend_not_confirmed":
         close = item.get("close")
         ma = item.get("ma")

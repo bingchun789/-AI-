@@ -1441,6 +1441,8 @@ HTML = """<!doctype html>
       const map = {
         signal_lost: '掉出当前列表',
         signal_lost_exit_disabled: '掉榜平仓已关闭',
+        signal_count_entry_confirming: '榜单数量开仓确认中',
+        signal_count_exit_confirming: '榜单数量平仓确认中',
         snapshot_protection: '快照保护（上轮仍在列表，本轮抓取可能遗漏）',
         signal_drop_guard: '信号骤降保护',
         signal_source_unstable: '信号源抓取异常，本轮不参与判断',
@@ -1490,6 +1492,8 @@ HTML = """<!doctype html>
       if (raw.startsWith('source_items_low:')) return '官方全榜条目明显偏少';
       if (raw.startsWith('positive_drop:')) return '强烈看多榜单数量异常下降';
       if (raw.startsWith('negative_drop:')) return '强烈看空榜单数量异常下降';
+      if (raw.startsWith('positive_collapse:')) return '强烈看多榜单严重塌陷';
+      if (raw.startsWith('negative_collapse:')) return '强烈看空榜单严重塌陷';
       if (raw === 'positive_rank_missing') return '强烈看多筛选结果缺少名次';
       if (raw === 'negative_rank_missing') return '强烈看空筛选结果缺少名次';
       if (raw.startsWith('positive_rank_gap:')) return '强烈看多从官方总榜筛选后断号，属正常现象';
@@ -1850,6 +1854,8 @@ HTML = """<!doctype html>
         ['service_inactive', '服务未运行'],
         ['signal_count_below_exit_threshold', '榜单数量跌破平仓阈值'],
         ['signal_count_entry_gate_blocked', '榜单数量未达到开仓门槛'],
+        ['signal_count_entry_confirming', '榜单数量开仓确认中'],
+        ['signal_count_exit_confirming', '榜单数量平仓确认中'],
         ['post_entry_weakness_exit', '开仓后弱化平仓'],
         ['signal_imbalance_blocked', '多空强信号失衡'],
         ['signal_count_too_low', '强信号数量不足'],

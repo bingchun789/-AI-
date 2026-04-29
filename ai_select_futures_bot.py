@@ -32,6 +32,7 @@ SHORT = "SHORT"
 
 LONG_STRATEGY_ID = "ai_select_futures_long"
 SHORT_STRATEGY_ID = "ai_select_futures_short"
+SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS = 3
 
 
 def load_dotenv(dotenv_path: Path) -> None:
@@ -1591,7 +1592,7 @@ def build_signal_candidates_from_assets_payload(
     return sort_signal_candidates(positive, negative)
 
 
-def is_signal_count_suspicious(
+def is_signal_count_severe_collapse(
     *,
     previous_count: int,
     current_count: int,
@@ -1603,26 +1604,10 @@ def is_signal_count_suspicious(
         return True
     if current_count >= previous_count:
         return False
-    review_ratio_threshold = math.ceil(previous_count * Decimal("0.85"))
-    review_threshold = max(int(min_candidates or 0), int(review_ratio_threshold))
-    return current_count < review_threshold
-
-
-def has_contiguous_signal_ranks(items: list[dict[str, Any]], side: str) -> bool:
-    if not items:
+    if previous_count < max(10, int(min_candidates or 0)):
         return False
-    ranks = [int_or_none(item.get("rank")) for item in items]
-    if any(rank is None for rank in ranks):
-        return False
-    rank_values = [int(rank) for rank in ranks if rank is not None]
-    if side == LONG:
-        return rank_values == list(range(1, len(rank_values) + 1))
-    if side == SHORT:
-        return all(
-            rank_values[index] - rank_values[index + 1] == 1
-            for index in range(len(rank_values) - 1)
-        )
-    return False
+    severe_threshold = max(5, math.floor(previous_count * Decimal("0.30")))
+    return current_count <= severe_threshold
 
 
 def find_rendered_signal_issues(
@@ -1643,21 +1628,21 @@ def find_rendered_signal_issues(
     previous_positive_count = len(previous_positive_snapshot)
     previous_negative_count = len(previous_negative_snapshot)
 
-    if is_signal_count_suspicious(
+    if is_signal_count_severe_collapse(
         previous_count=previous_positive_count,
         current_count=positive_count,
         min_candidates=config.signal_drop_guard_min_candidates,
-    ) and not has_contiguous_signal_ranks(rendered_positive, LONG):
+    ):
         issues.append(
-            f"positive_drop:{positive_count}/{previous_positive_count}"
+            f"positive_collapse:{positive_count}/{previous_positive_count}"
         )
-    if is_signal_count_suspicious(
+    if is_signal_count_severe_collapse(
         previous_count=previous_negative_count,
         current_count=negative_count,
         min_candidates=config.signal_drop_guard_min_candidates,
-    ) and not has_contiguous_signal_ranks(rendered_negative, SHORT):
+    ):
         issues.append(
-            f"negative_drop:{negative_count}/{previous_negative_count}"
+            f"negative_collapse:{negative_count}/{previous_negative_count}"
         )
     return issues
 
@@ -1784,6 +1769,47 @@ def signal_count_exit_threshold_for_side(config: BotConfig, side: str) -> int:
         if side == LONG
         else int(config.short_signal_count_to_close_below)
     )
+
+
+def update_signal_count_action_confirmation(
+    *,
+    state: dict[str, Any],
+    side: str,
+    action: str,
+    triggered: bool,
+    current_count: int,
+    threshold: int,
+) -> int:
+    confirmations = state.setdefault("signalCountActionConfirmations", {})
+    side_state = confirmations.setdefault(side, {})
+    key = "entry" if action == "entry" else "exit"
+    record = side_state.setdefault(key, {})
+    if not triggered:
+        record.clear()
+        record.update(
+            {
+                "rounds": 0,
+                "currentSignalCount": current_count,
+                "threshold": threshold,
+                "updatedAt": time.time(),
+            }
+        )
+        return 0
+    previous_rounds = int(record.get("rounds", 0) or 0)
+    if int(record.get("threshold", threshold) or threshold) != threshold:
+        previous_rounds = 0
+    rounds = previous_rounds + 1
+    record.clear()
+    record.update(
+        {
+            "rounds": rounds,
+            "requiredRounds": SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS,
+            "currentSignalCount": current_count,
+            "threshold": threshold,
+            "updatedAt": time.time(),
+        }
+    )
+    return rounds
 
 
 def int_or_none(value: Any) -> int | None:
@@ -3327,13 +3353,11 @@ def should_suspend_signal_lost_exit(
         return True
     if previous_count <= 0:
         return current_count < config.signal_drop_guard_min_candidates
-    if current_count >= previous_count:
-        return False
-    threshold = max(
-        config.signal_drop_guard_min_candidates,
-        math.ceil(previous_count * config.signal_drop_guard_ratio),
+    return is_signal_count_severe_collapse(
+        previous_count=previous_count,
+        current_count=current_count,
+        min_candidates=config.signal_drop_guard_min_candidates,
     )
-    return current_count < threshold
 
 
 def should_preserve_previous_snapshot(
@@ -3721,6 +3745,32 @@ def process_strategy(
         for key, position in state.get("positions", {}).items()
         if side_from_position(position) == side and position.get("strategyId") == strategy_id
     }
+    entry_confirmation_rounds = update_signal_count_action_confirmation(
+        state=state,
+        side=side,
+        action="entry",
+        triggered=(
+            bool(config.enable_signal_count_entry_gate)
+            and not block_new_entries
+            and not freeze_signal_decisions
+            and candidate_count >= entry_signal_count_threshold
+        ),
+        current_count=candidate_count,
+        threshold=entry_signal_count_threshold,
+    )
+    exit_confirmation_rounds = update_signal_count_action_confirmation(
+        state=state,
+        side=side,
+        action="exit",
+        triggered=(
+            bool(config.enable_signal_count_exit)
+            and not freeze_signal_decisions
+            and bool(current_positions)
+            and candidate_count < exit_signal_count_threshold
+        ),
+        current_count=candidate_count,
+        threshold=exit_signal_count_threshold,
+    )
 
     for key, position in list(current_positions.items()):
         if config.dry_run or broker.name != "binance_testnet":
@@ -4342,6 +4392,26 @@ def process_strategy(
             config.enable_signal_count_exit
             and candidate_count < exit_signal_count_threshold
         ):
+            if exit_confirmation_rounds < SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS:
+                position["signalLostRounds"] = 0
+                decisions.append(
+                    {
+                        "asset": position["asset"],
+                        "side": side,
+                        "action": "hold",
+                        "reason": "signal_count_exit_confirming",
+                        "detail": (
+                            f"当前强信号 {candidate_count} 个，已低于平仓阈值 "
+                            f"{exit_signal_count_threshold} 个；连续确认 "
+                            f"{SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS} 轮后才按榜单数量平仓"
+                        ),
+                        "currentSignalCount": candidate_count,
+                        "exitSignalCountThreshold": exit_signal_count_threshold,
+                        "confirmationRounds": exit_confirmation_rounds,
+                        "confirmationRequiredRounds": SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS,
+                    }
+                )
+                continue
             exit_audit = build_exit_audit_record(
                 config=config,
                 position=position,
@@ -4350,6 +4420,8 @@ def process_strategy(
             )
             exit_audit["currentSignalCount"] = candidate_count
             exit_audit["exitSignalCountThreshold"] = exit_signal_count_threshold
+            exit_audit["confirmationRounds"] = exit_confirmation_rounds
+            exit_audit["confirmationRequiredRounds"] = SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS
             close_result = broker.close_position(
                 contract_symbol=position["contractSymbol"],
                 asset=position["asset"],
@@ -4630,6 +4702,29 @@ def process_strategy(
                     ),
                     "currentSignalCount": candidate_count,
                     "requiredSignalCount": entry_signal_count_threshold,
+                }
+            )
+            continue
+        if (
+            config.enable_signal_count_entry_gate
+            and candidate_count >= entry_signal_count_threshold
+            and entry_confirmation_rounds < SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS
+        ):
+            decisions.append(
+                {
+                    "asset": asset,
+                    "side": side,
+                    "action": "skip",
+                    "reason": "signal_count_entry_confirming",
+                    "detail": (
+                        f"当前强信号 {candidate_count} 个，已达到开仓阈值 "
+                        f"{entry_signal_count_threshold} 个；连续确认 "
+                        f"{SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS} 轮后才允许开仓"
+                    ),
+                    "currentSignalCount": candidate_count,
+                    "requiredSignalCount": entry_signal_count_threshold,
+                    "confirmationRounds": entry_confirmation_rounds,
+                    "confirmationRequiredRounds": SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS,
                 }
             )
             continue
