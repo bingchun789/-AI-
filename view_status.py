@@ -283,15 +283,18 @@ def _signal_count_threshold_stats(
             "recentEndedAt": None,
             "recentDurationMinutes": None,
             "sampleCount": len(rows),
+            "segments": [],
         }
     segments: list[dict[str, Any]] = []
     active_start: float | None = None
     active_last_index: int | None = None
     active_samples = 0
+    active_max_count: int | None = None
+    active_min_count: int | None = None
     now_ts = time.time()
 
     def close_segment(next_timestamp: float | None) -> None:
-        nonlocal active_start, active_last_index, active_samples
+        nonlocal active_start, active_last_index, active_samples, active_max_count, active_min_count
         if active_start is None or active_last_index is None:
             return
         end_ts = next_timestamp if next_timestamp is not None else now_ts
@@ -306,11 +309,16 @@ def _signal_count_threshold_stats(
                 "endedAt": end_ts,
                 "durationMinutes": duration_minutes,
                 "sampleCount": active_samples,
+                "maxCount": active_max_count,
+                "minCount": active_min_count,
+                "confirmed": active_samples >= confirm_rounds,
             }
         )
         active_start = None
         active_last_index = None
         active_samples = 0
+        active_max_count = None
+        active_min_count = None
 
     for index, row in enumerate(rows):
         timestamp = float(row["timestamp"])
@@ -319,8 +327,12 @@ def _signal_count_threshold_stats(
             if active_start is None:
                 active_start = timestamp
                 active_samples = 0
+                active_max_count = count
+                active_min_count = count
             active_last_index = index
             active_samples += 1
+            active_max_count = max(active_max_count or count, count)
+            active_min_count = min(active_min_count or count, count)
             continue
         close_segment(timestamp)
     close_segment(None)
@@ -343,6 +355,11 @@ def _signal_count_threshold_stats(
         "recentEndedAt": recent.get("endedAt") if recent else None,
         "recentDurationMinutes": recent.get("durationMinutes") if recent else None,
         "sampleCount": len(rows),
+        "segments": sorted(
+            segments,
+            key=lambda item: float(item.get("startedAt") or 0),
+            reverse=True,
+        ),
     }
 
 

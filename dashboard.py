@@ -1095,6 +1095,10 @@ HTML = """<!doctype html>
           <strong>策略</strong>
           <small>状态、冷却与准入</small>
         </button>
+        <button class="tab-btn" type="button" data-tab="thresholds" role="tab" aria-selected="false">
+          <strong>门槛明细</strong>
+          <small>24小时触发区间</small>
+        </button>
         <button class="tab-btn" type="button" data-tab="attribution" role="tab" aria-selected="false">
           <strong>归因</strong>
           <small>榜单密度与策略统计</small>
@@ -1207,6 +1211,16 @@ HTML = """<!doctype html>
               <button class="action-btn" id="resetCooldownBtn" onclick="resetCooldowns()">一键重置冷却</button>
             </div>
             <div id="cooldownWrap"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="tab-panel" data-panel="thresholds" role="tabpanel">
+        <div class="section-stack">
+          <div class="card card-table">
+            <div class="label">开仓门槛 24 小时明细</div>
+            <div class="sub">连续满足当前开仓门槛算一次；跌破门槛后再次达到，算新的一次。这里显示信号环境，不等于实际下单次数。</div>
+            <div id="signalThresholdOccurrencesWrap"></div>
           </div>
         </div>
       </section>
@@ -1336,7 +1350,7 @@ HTML = """<!doctype html>
       return num.toFixed(digits);
     }
 
-    const VALID_TABS = ['overview', 'positions', 'strategy', 'attribution', 'records', 'recovery', 'monitor', 'risk', 'settings'];
+    const VALID_TABS = ['overview', 'positions', 'strategy', 'thresholds', 'attribution', 'records', 'recovery', 'monitor', 'risk', 'settings'];
 
     function setActiveTab(tabName, syncHash = true) {
       const target = VALID_TABS.includes(tabName) ? tabName : 'overview';
@@ -2464,6 +2478,79 @@ HTML = """<!doctype html>
           </div>
         `;
       }).join('');
+    }
+
+    function renderSignalThresholdOccurrences(strategies) {
+      const wrap = document.getElementById('signalThresholdOccurrencesWrap');
+      if (!wrap) return;
+      const entries = Object.entries(strategies || {}).sort(([, a], [, b]) => {
+        const aPriority = a?.side === 'SHORT' ? 1 : 0;
+        const bPriority = b?.side === 'SHORT' ? 1 : 0;
+        return aPriority - bPriority;
+      });
+      const rows = [];
+      for (const [, item] of entries) {
+        const stats = item?.signalCountEntryGate24h || {};
+        const segments = Array.isArray(stats.segments) ? stats.segments : [];
+        const threshold = stats.threshold ?? '-';
+        const confirmRounds = stats.confirmRounds ?? 3;
+        segments.forEach((segment, index) => {
+          rows.push({
+            side: item?.side,
+            index: index + 1,
+            threshold,
+            confirmRounds,
+            startedAt: segment?.startedAt,
+            endedAt: segment?.endedAt,
+            durationMinutes: segment?.durationMinutes,
+            minCount: segment?.minCount,
+            maxCount: segment?.maxCount,
+            sampleCount: segment?.sampleCount,
+            confirmed: segment?.confirmed === true,
+          });
+        });
+      }
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="empty">过去 24 小时没有出现达到当前开仓门槛的区间。</div>';
+        return;
+      }
+      rows.sort((a, b) => Number(b.startedAt || 0) - Number(a.startedAt || 0));
+      const body = rows.map(row => `
+        <tr>
+          <td>${sidePill(row.side)}</td>
+          <td>≥ ${escapeHtml(row.threshold)} 个</td>
+          <td>${escapeHtml(row.startedAt ? fmtCloseTime(row.startedAt) : '-')}</td>
+          <td>${escapeHtml(row.endedAt ? fmtCloseTime(row.endedAt) : '-')}</td>
+          <td>${row.durationMinutes != null ? `${fmt(row.durationMinutes, 1)} 分钟` : '-'}</td>
+          <td>${escapeHtml(row.minCount ?? '-')} / ${escapeHtml(row.maxCount ?? '-')}</td>
+          <td>${escapeHtml(row.sampleCount ?? 0)} 轮</td>
+          <td>${row.confirmed ? `<span class="pill good">已满足 ${escapeHtml(row.confirmRounds)} 轮</span>` : `<span class="pill warn">未满 ${escapeHtml(row.confirmRounds)} 轮</span>`}</td>
+        </tr>
+      `).join('');
+      wrap.innerHTML = `
+        <div class="overview-lines attribution-summary" style="margin-bottom:10px;">
+          <div class="overview-line"><span>区间总数</span><strong>${rows.length} 次</strong></div>
+          <div class="overview-line"><span>满足连续确认</span><strong>${rows.filter(row => row.confirmed).length} 次</strong></div>
+          <div class="overview-line"><span>统计窗口</span><strong>最近 24 小时</strong></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>方向</th>
+                <th>门槛</th>
+                <th>开始时间</th>
+                <th>结束时间</th>
+                <th>持续</th>
+                <th>最低/最高</th>
+                <th>采样轮数</th>
+                <th>确认状态</th>
+              </tr>
+            </thead>
+            <tbody>${body}</tbody>
+          </table>
+        </div>
+      `;
     }
 
     function renderUnopenedCandidates(items) {
@@ -4575,6 +4662,7 @@ HTML = """<!doctype html>
         renderOverallSummary(data);
         renderPositions(data.positions || []);
         renderStrategies(data.strategies || {});
+        renderSignalThresholdOccurrences(data.strategies || {});
         renderUnopenedCandidates(data.unopenedCandidates || []);
         renderCooldowns(data.cooldownSummary || {}, data.activeCooldowns || []);
         renderBestWorst(data);
