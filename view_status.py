@@ -175,6 +175,91 @@ def _load_signal_snapshot(path: Path) -> dict[str, Any]:
     }
 
 
+def _load_signal_count_history(workdir: Path) -> list[dict[str, Any]]:
+    rows = _load_json(workdir / "runtime" / "signal_count_history.json", [])
+    if not isinstance(rows, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    cutoff = time.time() - 24 * 3600
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        timestamp = _coerce_timestamp_seconds(row.get("timestamp"))
+        if timestamp is None or timestamp < cutoff:
+            continue
+        normalized.append(
+            {
+                "timestamp": timestamp,
+                "longCount": int(row.get("longCount", 0) or 0),
+                "shortCount": int(row.get("shortCount", 0) or 0),
+            }
+        )
+    return sorted(normalized, key=lambda item: item["timestamp"])
+
+
+def _signal_count_peak_stats(
+    rows: list[dict[str, Any]],
+    count_key: str,
+) -> dict[str, Any]:
+    if not rows:
+        return {
+            "peakCount": None,
+            "startedAt": None,
+            "endedAt": None,
+            "durationMinutes": None,
+            "sampleCount": 0,
+        }
+    peak_count = max(int(row.get(count_key, 0) or 0) for row in rows)
+    best_start = None
+    best_end = None
+    best_duration = Decimal("-1")
+    active_start = None
+    active_last_index = None
+    now_ts = time.time()
+
+    def close_segment(next_timestamp: float | None) -> None:
+        nonlocal active_start, active_last_index, best_start, best_end, best_duration
+        if active_start is None or active_last_index is None:
+            return
+        end_ts = next_timestamp if next_timestamp is not None else now_ts
+        if end_ts < active_start:
+            end_ts = rows[active_last_index]["timestamp"]
+        duration = Decimal(str(max(0, end_ts - active_start))) / Decimal("60")
+        if duration > best_duration:
+            best_duration = duration
+            best_start = active_start
+            best_end = end_ts
+        active_start = None
+        active_last_index = None
+
+    for index, row in enumerate(rows):
+        timestamp = float(row["timestamp"])
+        count = int(row.get(count_key, 0) or 0)
+        if count == peak_count:
+            if active_start is None:
+                active_start = timestamp
+            active_last_index = index
+            continue
+        close_segment(timestamp)
+    close_segment(None)
+
+    return {
+        "peakCount": peak_count,
+        "startedAt": best_start,
+        "endedAt": best_end,
+        "durationMinutes": float(best_duration) if best_duration >= 0 else 0,
+        "sampleCount": len(rows),
+    }
+
+
+def _build_signal_count_peak_stats(workdir: Path) -> dict[str, dict[str, Any]]:
+    rows = _load_signal_count_history(workdir)
+    return {
+        LONG_STRATEGY_ID: _signal_count_peak_stats(rows, "longCount"),
+        SHORT_STRATEGY_ID: _signal_count_peak_stats(rows, "shortCount"),
+    }
+
+
 def _signal_row_identity(row: dict[str, Any]) -> tuple[Any, Any]:
     return (row.get("rank"), row.get("asset") or row.get("rawAsset"))
 
@@ -3580,12 +3665,14 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         LONG_STRATEGY_ID: _load_signal_snapshot(workdir / "runtime/strong_positive_snapshot.json"),
         SHORT_STRATEGY_ID: _load_signal_snapshot(workdir / "runtime/strong_negative_snapshot.json"),
     }
+    signal_count_peak_stats = _build_signal_count_peak_stats(workdir)
     strategy_statuses = {
         key: {
             **value,
             "signalSnapshotUpdatedAt": signal_snapshots.get(key, {}).get("updatedAt"),
             "signalSnapshotCount": signal_snapshots.get(key, {}).get("count", 0),
             "signalSnapshotItems": signal_snapshots.get(key, {}).get("items", []),
+            "signalCountPeak24h": signal_count_peak_stats.get(key, {}),
         }
         for key, value in strategy_statuses.items()
     }
@@ -3725,6 +3812,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             "signalSnapshotUpdatedAt": snapshot_meta.get("updatedAt"),
             "signalSnapshotCount": snapshot_count,
             "signalSnapshotItems": snapshot_items,
+            "signalCountPeak24h": signal_count_peak_stats.get(key, {}),
             "signalSnapshotIsProtected": _is_signal_snapshot_protected(
                 current_candidate_items,
                 snapshot_items,

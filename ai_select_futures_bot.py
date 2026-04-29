@@ -3318,6 +3318,39 @@ def write_snapshot(path: Path, candidates: list[dict[str, Any]]) -> None:
     write_json_atomic(path, snapshot)
 
 
+def record_signal_count_snapshot(
+    *,
+    workdir: Path,
+    positive_count: int,
+    negative_count: int,
+    signal_meta: dict[str, Any],
+) -> None:
+    if signal_meta.get("blockNewEntries"):
+        return
+    history_path = workdir / "runtime" / "signal_count_history.json"
+    now_ts = time.time()
+    cutoff_ts = now_ts - 25 * 3600
+    try:
+        existing = json.loads(history_path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        existing = []
+    rows = [
+        row
+        for row in (existing if isinstance(existing, list) else [])
+        if isinstance(row, dict)
+        and float(row.get("timestamp") or 0) >= cutoff_ts
+    ]
+    rows.append(
+        {
+            "timestamp": now_ts,
+            "longCount": int(positive_count),
+            "shortCount": int(negative_count),
+            "source": signal_meta.get("source"),
+        }
+    )
+    write_json_atomic(history_path, rows)
+
+
 def load_snapshot_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -5304,6 +5337,12 @@ def run_once(config: BotConfig) -> dict[str, Any]:
         len(negative_candidates),
         positive_assets,
         prev_positive_assets,
+    )
+    record_signal_count_snapshot(
+        workdir=config.state_file.parent.parent,
+        positive_count=len(positive_candidates),
+        negative_count=len(negative_candidates),
+        signal_meta=signal_meta,
     )
     suspend_long_signal_lost_exit = should_suspend_signal_lost_exit(
         config=config,

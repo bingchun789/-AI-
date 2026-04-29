@@ -2324,6 +2324,23 @@ HTML = """<!doctype html>
         const snapshotUpdatedAt = item?.signalSnapshotUpdatedAt ? fmtCloseTime(item.signalSnapshotUpdatedAt) : '-';
         const snapshotCount = item?.signalSnapshotCount ?? snapshotItems.length ?? 0;
         const snapshotProtected = item?.signalSnapshotIsProtected === true;
+        const peakStats = item?.signalCountPeak24h || {};
+        const peakLabel = item?.side === 'SHORT'
+          ? '\u0032\u0034\u5c0f\u65f6\u6700\u9ad8\u5f3a\u70c8\u770b\u7a7a'
+          : '\u0032\u0034\u5c0f\u65f6\u6700\u9ad8\u5f3a\u70c8\u770b\u591a';
+        const peakCount = peakStats.peakCount ?? '-';
+        const peakStartedAt = peakStats.startedAt ? fmtCloseTime(peakStats.startedAt) : '-';
+        const peakEndedAt = peakStats.endedAt ? fmtCloseTime(peakStats.endedAt) : '-';
+        const peakDuration = peakStats.durationMinutes !== null && peakStats.durationMinutes !== undefined
+          ? `${fmt(peakStats.durationMinutes, 1)} \u5206\u949f`
+          : '-';
+        const peakHtml = `
+          <div style="margin-top:8px;padding-top:8px;border-top:1px dashed #e5e7eb;">
+            <div>${peakLabel}: ${escapeHtml(peakCount)} \u4e2a</div>
+            <div class="sub">\u51fa\u73b0\u65f6\u95f4: ${escapeHtml(peakStartedAt)}</div>
+            <div class="sub">\u6301\u7eed\u65f6\u95f4: ${escapeHtml(peakDuration)}\uff0c\u7ed3\u675f\u65f6\u95f4: ${escapeHtml(peakEndedAt)}</div>
+          </div>
+        `;
         const blockedHtml = openSummary.summaryRows.length
           ? `<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #e5e7eb;">
                <div><strong>\u672c\u8f6e\u672a\u65b0\u5f00\u4ed3</strong> ${openSummary.blockedCount} \u4e2a</div>
@@ -2424,6 +2441,7 @@ HTML = """<!doctype html>
             <div>\u6709\u5408\u7ea6\u4f46\u5f53\u524d\u73af\u5883\u672a\u5f00\u901a\u4ea4\u6613: ${openSummary.contractNotTradingCount ?? 0} \u4e2a</div>
             <div>\u7d2f\u8ba1\u5e73\u4ed3: ${item.closedCount ?? 0} \u4e2a</div>
             <div>\u5df2\u5b9e\u73b0\u76c8\u4e8f: ${fmt(item.realizedPnlUsdt, 4)} USDT</div>
+            ${peakHtml}
             ${blockedHtml}
             ${currentHtml}
             ${snapshotHtml}
