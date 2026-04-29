@@ -33,11 +33,18 @@ def _default_registry() -> dict[str, Any]:
     }
 
 
+def write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{time.time_ns()}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
 def ensure_strategy_registry(path: Path) -> dict[str, Any]:
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8-sig"))
     data = _default_registry()
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(path, data)
     return data
 
 
@@ -71,5 +78,4 @@ def write_strategy_status(path: Path, strategy_id: str, status: dict[str, Any]) 
         **status,
         "updatedAt": time.time(),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(path, current)

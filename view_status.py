@@ -34,6 +34,168 @@ def _load_json(path: Path, default: Any) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def _coerce_timestamp_seconds(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if numeric <= 0:
+        return None
+    if numeric >= 100000000000:
+        numeric /= 1000
+    return numeric
+
+
+def _average_interval_seconds(timestamps: list[float]) -> int | None:
+    if len(timestamps) < 2:
+        return None
+    intervals = [
+        current - previous
+        for previous, current in zip(timestamps, timestamps[1:])
+        if current >= previous
+    ]
+    if not intervals:
+        return None
+    return int(sum(intervals) / len(intervals))
+
+
+def _build_runtime_stats(
+    all_history: list[dict[str, Any]],
+    equity_history: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+    strategy_statuses: dict[str, dict[str, Any]],
+    reset_cutoff_ms: int | None,
+) -> dict[str, Any]:
+    cutoff_seconds = (
+        float(reset_cutoff_ms) / 1000 if reset_cutoff_ms not in (None, 0) else None
+    )
+    candidates: list[tuple[float, str]] = []
+
+    def add_candidate(value: Any, source: str) -> None:
+        timestamp = _coerce_timestamp_seconds(value)
+        if timestamp is None:
+            return
+        if cutoff_seconds is not None and timestamp < cutoff_seconds:
+            return
+        candidates.append((timestamp, source))
+
+    if cutoff_seconds is not None:
+        candidates.append((cutoff_seconds, "reset_marker"))
+
+    for event in all_history:
+        add_candidate(event.get("timestamp"), "history")
+    for point in equity_history:
+        add_candidate(point.get("timestamp"), "equity_history")
+    for row in positions:
+        add_candidate(row.get("openedAt"), "position")
+    for item in strategy_statuses.values():
+        add_candidate(item.get("updatedAt"), "strategy_status")
+        add_candidate(item.get("currentCandidateUpdatedAt"), "strategy_status")
+        add_candidate(item.get("signalSnapshotUpdatedAt"), "signal_snapshot")
+
+    if not candidates:
+        return {
+            "startedAt": None,
+            "durationSeconds": None,
+            "startSource": None,
+        }
+
+    started_at, start_source = min(candidates, key=lambda item: item[0])
+    duration_seconds = max(0, int(time.time() - started_at))
+    return {
+        "startedAt": started_at,
+        "durationSeconds": duration_seconds,
+        "startSource": start_source,
+    }
+
+
+def _build_open_frequency(all_history: list[dict[str, Any]]) -> dict[str, Any]:
+    timestamps = sorted(
+        timestamp
+        for timestamp in (
+            _coerce_timestamp_seconds(event.get("timestamp"))
+            for event in all_history
+            if event.get("action") in ENTRY_ACTIONS
+        )
+        if timestamp is not None
+    )
+    now_ts = time.time()
+    one_hour_ago = now_ts - 3600
+    twenty_four_hours_ago = now_ts - (24 * 3600)
+    seven_days_ago = now_ts - (7 * 24 * 3600)
+
+    last_1h = [timestamp for timestamp in timestamps if timestamp >= one_hour_ago]
+    last_24h = [timestamp for timestamp in timestamps if timestamp >= twenty_four_hours_ago]
+    last_7d = [timestamp for timestamp in timestamps if timestamp >= seven_days_ago]
+
+    return {
+        "openCount1h": len(last_1h),
+        "openCount24h": len(last_24h),
+        "openCount7d": len(last_7d),
+        "openCountTotal": len(timestamps),
+        "avgIntervalSeconds24h": _average_interval_seconds(last_24h),
+        "avgIntervalSeconds7d": _average_interval_seconds(last_7d),
+        "lastOpenedAt": timestamps[-1] if timestamps else None,
+    }
+
+
+def _normalize_signal_rows(raw_rows: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not isinstance(raw_rows, list):
+        return rows
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "rank": item.get("rank"),
+                "sourceRank": item.get("sourceRank"),
+                "asset": item.get("asset") or item.get("rawAsset"),
+                "rawAsset": item.get("rawAsset"),
+                "assetType": item.get("assetType"),
+                "score": item.get("score"),
+                "scoreLabel": item.get("scoreLabel"),
+                "newsLabel": item.get("newsLabel"),
+                "socialLabel": item.get("socialLabel"),
+                "kolLabel": item.get("kolLabel"),
+            }
+        )
+    return rows
+
+
+def _load_signal_snapshot(path: Path) -> dict[str, Any]:
+    rows = _normalize_signal_rows(_load_json(path, []))
+    updated_at = path.stat().st_mtime if path.exists() else None
+    return {
+        "updatedAt": updated_at,
+        "count": len(rows),
+        "items": rows,
+    }
+
+
+def _signal_row_identity(row: dict[str, Any]) -> tuple[Any, Any]:
+    return (row.get("rank"), row.get("asset") or row.get("rawAsset"))
+
+
+def _is_signal_snapshot_protected(
+    current_items: list[dict[str, Any]],
+    snapshot_items: list[dict[str, Any]],
+    current_count: int,
+    snapshot_count: int,
+) -> bool:
+    if int(current_count or 0) != int(snapshot_count or 0):
+        return True
+    if len(current_items) != len(snapshot_items):
+        return True
+    return [
+        _signal_row_identity(row) for row in current_items
+    ] != [
+        _signal_row_identity(row) for row in snapshot_items
+    ]
+
+
 def _local_state_positions_by_symbol_side(state: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
     rows: dict[tuple[str, str], dict[str, Any]] = {}
     for position in state.get("positions", {}).values():
@@ -61,6 +223,10 @@ def _build_local_positions(state: dict[str, Any], broker: Any) -> list[dict[str,
         contract_symbol = pos.get("contractSymbol")
         if not contract_symbol:
             continue
+        entry_long_count, entry_short_count = _entry_signal_counts(
+            pos.get("side", LONG),
+            pos.get("entryAudit"),
+        )
         entry_price = Decimal(str(pos.get("entryPrice", "0")))
         mark_price = mark_prices.get(contract_symbol)
         if mark_price is None:
@@ -96,6 +262,8 @@ def _build_local_positions(state: dict[str, Any], broker: Any) -> list[dict[str,
                 "pnlPct": pnl_pct,
                 "status": pos.get("status"),
                 "openedAt": pos.get("openedAt"),
+                "entryStrongLongCount": entry_long_count,
+                "entryStrongShortCount": entry_short_count,
                 "returnBasisUsdt": pos.get("returnBasisUsdt"),
                 "stopLossPrice": pos.get("stopLossPrice"),
                 "stopLossStatus": pos.get("stopLossStatus"),
@@ -148,6 +316,47 @@ def _normalize_margin_mode(raw_value: Any) -> str | None:
     return value
 
 
+def _format_margin_mode_label(raw_value: Any) -> str:
+    value = _normalize_margin_mode(raw_value)
+    if value == "ISOLATED":
+        return "逐仓"
+    if value == "CROSS":
+        return "全仓"
+    if value == "MIXED":
+        return "混合"
+    return value or "-"
+
+
+def _apply_live_trading_setup_to_rules(
+    items: list[dict[str, str]],
+    config: Any,
+    trading_setup: dict[str, Any],
+) -> list[dict[str, str]]:
+    long_leverage = trading_setup.get("longLeverage") or str(config.leverage)
+    short_leverage = trading_setup.get("shortLeverage") or str(config.leverage)
+    long_margin_mode = _format_margin_mode_label(
+        trading_setup.get("longMarginMode") or config.required_margin_mode
+    )
+    short_margin_mode = _format_margin_mode_label(
+        trading_setup.get("shortMarginMode") or config.required_margin_mode
+    )
+    adjusted: list[dict[str, str]] = []
+    for item in items:
+        if item.get("title") == "杠杆模式":
+            adjusted.append(
+                {
+                    "title": "杠杆模式",
+                    "value": (
+                        f"做多 {long_leverage}X {long_margin_mode}，"
+                        f"做空 {short_leverage}X {short_margin_mode}"
+                    ),
+                }
+            )
+            continue
+        adjusted.append(item)
+    return adjusted
+
+
 def _build_rule_summary(config: Any) -> list[dict[str, str]]:
     cooldown_label = (
         f"{config.cooldown_minutes // 60} 小时"
@@ -163,7 +372,7 @@ def _build_rule_summary(config: Any) -> list[dict[str, str]]:
         {"title": "冷却时间", "value": f"平仓后 {cooldown_label} 内不重开同方向"},
         {
             "title": "仓位上限",
-            "value": f"做多最多 {config.max_long_open_positions} 个，做空最多 {config.max_short_open_positions} 个，总共最多 {config.max_total_open_positions} 个",
+            "value": f"单边上限：做多最多 {config.max_long_open_positions} 个，做空最多 {config.max_short_open_positions} 个；总持仓上限：合计最多 {config.max_total_open_positions} 个",
         },
         {
             "title": "流动性要求",
@@ -277,6 +486,17 @@ def _build_config_toggles(config: Any) -> list[dict[str, Any]]:
             "detail": f"开仓后立即挂 {config.stop_loss_pct}% 硬止损单。",
         },
         {
+            "key": "STOP_LOSS_PCT",
+            "label": "\u786c\u6b62\u635f\u6bd4\u4f8b",
+            "type": "number",
+            "value": float(config.stop_loss_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "showWhen": {"key": "ENABLE_STOP_LOSS"},
+            "detail": "\u5f00\u542f\u786c\u6b62\u635f\u540e\uff0c\u6309\u8fd9\u4e2a\u6bd4\u4f8b\u8bbe\u7f6e\u786c\u6b62\u635f\u3002",
+        },
+        {
             "key": "ENABLE_PROFIT_LOCK",
             "label": "分级锁盈",
             "enabled": config.enable_profit_lock,
@@ -290,6 +510,28 @@ def _build_config_toggles(config: Any) -> list[dict[str, Any]]:
                 f"收益达到 {config.profit_protection_activate_pct}% 后启动，"
                 f"相对峰值回撤 {config.profit_protection_trail_pct}% 平仓。"
             ),
+        },
+        {
+            "key": "PROFIT_PROTECTION_ACTIVATE_PCT",
+            "label": "\u542f\u52a8\u6536\u76ca\u7387",
+            "type": "number",
+            "value": float(config.profit_protection_activate_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "showWhen": {"key": "ENABLE_PROFIT_PROTECTION"},
+            "detail": "\u6536\u76ca\u7387\u5230\u8fbe\u8fd9\u4e2a\u9608\u503c\u540e\uff0c\u624d\u5f00\u59cb\u542f\u7528\u5229\u6da6\u56de\u64a4\u4fdd\u62a4\u3002",
+        },
+        {
+            "key": "PROFIT_PROTECTION_TRAIL_PCT",
+            "label": "\u5cf0\u503c\u56de\u64a4\u5e73\u4ed3",
+            "type": "number",
+            "value": float(config.profit_protection_trail_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "showWhen": {"key": "ENABLE_PROFIT_PROTECTION"},
+            "detail": "\u542f\u52a8\u540e\uff0c\u82e5\u5f53\u524d\u6536\u76ca\u8f83\u5386\u53f2\u5cf0\u503c\u56de\u64a4\u5230\u8fd9\u4e2a\u6bd4\u4f8b\uff0c\u5219\u6267\u884c\u5e73\u4ed3\u3002",
         },
         {
             "key": "ENABLE_SIGNAL_DROP_GUARD",
@@ -315,6 +557,47 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
         "value": (
             f"同方向强烈信号少于 {config.min_signal_count_to_open} 个时，不开该方向新仓"
             if config.enable_min_signal_count_filter
+            else "已关闭"
+        ),
+    }
+    entry_gate_rule = {
+        "title": "榜单数量开仓",
+        "value": (
+            f"做多达到 {config.min_long_signal_count_to_open} 个才开多；"
+            f"做空达到 {config.min_short_signal_count_to_open} 个才开空"
+            if config.enable_signal_count_entry_gate
+            else "已关闭"
+        ),
+    }
+    imbalance_rule = {
+        "title": "\u591a\u7a7a\u5931\u8861\u8fc7\u6ee4",
+        "value": (
+            f"\u5f53\u591a\u7a7a\u4e24\u8fb9\u5f3a\u4fe1\u53f7\u90fd\u8fbe\u5230 {config.signal_imbalance_min_count} \u4e2a\uff0c"
+            f"\u4e14\u4e00\u8fb9\u6570\u91cf\u8fbe\u5230\u53e6\u4e00\u8fb9\u7684 {config.signal_imbalance_ratio:g} \u500d\u65f6\uff0c"
+            "\u6682\u505c\u5f31\u52bf\u65b9\u5411\u5f00\u65b0\u4ed3"
+            if config.enable_signal_imbalance_filter
+            else "\u5df2\u5173\u95ed"
+        ),
+    }
+    exit_gate_rule = {
+        "title": "榜单数量平仓",
+        "value": (
+            f"做多少于 {config.long_signal_count_to_close_below} 个平全部做多仓；"
+            f"做空少于 {config.short_signal_count_to_close_below} 个平全部做空仓"
+            if config.enable_signal_count_exit
+            else "已关闭"
+        ),
+    }
+    post_entry_weak_rule = {
+        "title": "开仓后弱化平仓",
+        "value": (
+            f"做多 {config.long_weak_exit_start_minutes}-{config.long_weak_exit_end_minutes} 分钟内，"
+            f"若历史最高收益未到 {config.long_weak_exit_min_peak_pnl_pct:g}% 且强烈看多个数减少 "
+            f"{config.long_weak_exit_signal_drop_count} 个或排名后移 {config.long_weak_exit_rank_drop} 名则平仓；"
+            f"做空 {config.short_weak_exit_start_minutes}-{config.short_weak_exit_end_minutes} 分钟内，"
+            f"若历史最高收益未跑出正收益且强烈看空减少 {config.short_weak_exit_signal_drop_count} 个"
+            f"或强烈看多回升 {config.short_weak_exit_opposite_rebound_count} 个则平仓"
+            if config.enable_post_entry_weak_exit
             else "已关闭"
         ),
     }
@@ -356,7 +639,16 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
             ),
         },
     ]
-    return [*items[:5], rule, *new_rules, *items[5:]]
+    return [
+        *items[:5],
+        rule,
+        entry_gate_rule,
+        imbalance_rule,
+        exit_gate_rule,
+        post_entry_weak_rule,
+        *new_rules,
+        *items[5:],
+    ]
 
 
 def _augment_config_toggles(items: list[dict[str, Any]], config: Any) -> list[dict[str, Any]]:
@@ -366,6 +658,102 @@ def _augment_config_toggles(items: list[dict[str, Any]], config: Any) -> list[di
         "enabled": config.enable_min_signal_count_filter,
         "detail": f"同方向强烈看多/看空少于 {config.min_signal_count_to_open} 个时，不开该方向新仓。",
     }
+    entry_gate_controls = [
+        {
+            "key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE",
+            "label": "榜单数量开仓",
+            "enabled": config.enable_signal_count_entry_gate,
+            "detail": "按强烈看多、强烈看空的列表数量，分别控制做多和做空方向是否允许开新仓。",
+        },
+        {
+            "key": "MIN_LONG_SIGNAL_COUNT_TO_OPEN",
+            "label": "做多开仓最少个数",
+            "type": "number",
+            "value": int(config.min_long_signal_count_to_open),
+            "min": 0,
+            "step": 1,
+            "unit": "个",
+            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE"},
+            "detail": "当前强烈看多个数达到这个值后，才允许做多方向开新仓。",
+        },
+        {
+            "key": "MIN_SHORT_SIGNAL_COUNT_TO_OPEN",
+            "label": "做空开仓最少个数",
+            "type": "number",
+            "value": int(config.min_short_signal_count_to_open),
+            "min": 0,
+            "step": 1,
+            "unit": "个",
+            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE"},
+            "detail": "当前强烈看空个数达到这个值后，才允许做空方向开新仓。",
+        },
+    ]
+    imbalance_controls = [
+        {
+            "key": "ENABLE_SIGNAL_IMBALANCE_FILTER",
+            "label": "\u591a\u7a7a\u5931\u8861\u8fc7\u6ee4",
+            "enabled": config.enable_signal_imbalance_filter,
+            "detail": (
+                f"\u5f53\u591a\u7a7a\u4e24\u8fb9\u5f3a\u4fe1\u53f7\u90fd\u8fbe\u5230 {config.signal_imbalance_min_count} \u4e2a\uff0c"
+                f"\u4e14\u4e00\u8fb9\u6570\u91cf\u8fbe\u5230\u53e6\u4e00\u8fb9\u7684 {config.signal_imbalance_ratio:g} \u500d\u65f6\uff0c"
+                "\u6682\u505c\u5f31\u52bf\u65b9\u5411\u5f00\u65b0\u4ed3\u3002"
+            ),
+        },
+        {
+            "key": "SIGNAL_IMBALANCE_MIN_COUNT",
+            "label": "\u5931\u8861\u8d77\u7b97\u6570\u91cf",
+            "type": "number",
+            "value": int(config.signal_imbalance_min_count),
+            "min": 1,
+            "step": 1,
+            "unit": "\u4e2a",
+            "showWhen": {"key": "ENABLE_SIGNAL_IMBALANCE_FILTER"},
+            "detail": "\u53ea\u6709\u591a\u7a7a\u4e24\u8fb9\u5f3a\u4fe1\u53f7\u90fd\u8fbe\u5230\u8fd9\u4e2a\u6570\u91cf\u540e\uff0c\u624d\u542f\u7528\u591a\u7a7a\u5931\u8861\u8fc7\u6ee4\u3002",
+        },
+        {
+            "key": "SIGNAL_IMBALANCE_RATIO",
+            "label": "\u5931\u8861\u500d\u6570",
+            "type": "number",
+            "value": float(config.signal_imbalance_ratio),
+            "min": 1,
+            "step": 0.1,
+            "unit": "\u500d",
+            "showWhen": {"key": "ENABLE_SIGNAL_IMBALANCE_FILTER"},
+            "detail": "\u5f53\u5f3a\u52bf\u4e00\u8fb9\u6570\u91cf\u8fbe\u5230\u5f31\u52bf\u4e00\u8fb9\u8fd9\u4e2a\u500d\u6570\u65f6\uff0c\u6682\u505c\u5f31\u52bf\u4e00\u8fb9\u5f00\u65b0\u4ed3\u3002",
+        },
+    ]
+    position_limit_controls = [
+        {
+            "key": "MAX_TOTAL_OPEN_POSITIONS",
+            "label": "\u603b\u6301\u4ed3\u4e0a\u9650",
+            "type": "number",
+            "value": int(config.max_total_open_positions),
+            "min": 0,
+            "step": 1,
+            "unit": "\u4e2a",
+            "detail": "\u5168\u90e8\u4ed3\u4f4d\u5408\u8ba1\u6700\u591a\u5141\u8bb8\u7684\u540c\u65f6\u6301\u4ed3\u6570\u91cf\u3002",
+        },
+        {
+            "key": "MAX_LONG_OPEN_POSITIONS",
+            "label": "\u505a\u591a\u6301\u4ed3\u4e0a\u9650",
+            "type": "number",
+            "value": int(config.max_long_open_positions),
+            "min": 0,
+            "step": 1,
+            "unit": "\u4e2a",
+            "detail": "\u505a\u591a\u65b9\u5411\u6700\u591a\u5141\u8bb8\u7684\u540c\u65f6\u6301\u4ed3\u6570\u91cf\u3002",
+        },
+        {
+            "key": "MAX_SHORT_OPEN_POSITIONS",
+            "label": "\u505a\u7a7a\u6301\u4ed3\u4e0a\u9650",
+            "type": "number",
+            "value": int(config.max_short_open_positions),
+            "min": 0,
+            "step": 1,
+            "unit": "\u4e2a",
+            "detail": "\u505a\u7a7a\u65b9\u5411\u6700\u591a\u5141\u8bb8\u7684\u540c\u65f6\u6301\u4ed3\u6570\u91cf\u3002",
+        },
+    ]
     risk_controls = [
         {
             "key": "ENABLE_ACCOUNT_CIRCUIT_BREAKER",
@@ -538,16 +926,198 @@ def _augment_config_toggles(items: list[dict[str, Any]], config: Any) -> list[di
             "detail": "例如 0.5 表示先平掉一半仓位。",
         },
     ]
-    return [items[0], toggle, *risk_controls, *items[1:]] if items else [toggle, *risk_controls]
+    exit_gate_controls = [
+        {
+            "key": "ENABLE_SIGNAL_COUNT_EXIT",
+            "label": "榜单数量平仓",
+            "enabled": config.enable_signal_count_exit,
+            "detail": "当当前强烈看多或强烈看空的列表数量跌破阈值时，按方向平掉全部策略仓位。",
+        },
+        {
+            "key": "LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+            "label": "做多少于此个数平仓",
+            "type": "number",
+            "value": int(config.long_signal_count_to_close_below),
+            "min": 0,
+            "step": 1,
+            "unit": "个",
+            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_EXIT"},
+            "detail": "当前强烈看多个数低于这个值时，平掉全部做多策略仓位。",
+        },
+        {
+            "key": "SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
+            "label": "做空少于此个数平仓",
+            "type": "number",
+            "value": int(config.short_signal_count_to_close_below),
+            "min": 0,
+            "step": 1,
+            "unit": "个",
+            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_EXIT"},
+            "detail": "当前强烈看空个数低于这个值时，平掉全部做空策略仓位。",
+        },
+    ]
+    post_entry_weak_exit_controls = [
+        {
+            "key": "ENABLE_POST_ENTRY_WEAK_EXIT",
+            "label": "开仓后弱化平仓",
+            "enabled": config.enable_post_entry_weak_exit,
+            "detail": "开仓后一段时间内，如果一直没跑出目标收益，同时榜单数量或排名明显走弱，就提前平仓。",
+        },
+        {
+            "key": "LONG_WEAK_EXIT_START_MINUTES",
+            "label": "做多观察开始",
+            "type": "number",
+            "value": int(config.long_weak_exit_start_minutes),
+            "min": 0,
+            "step": 1,
+            "unit": "分钟",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做多开仓后，从这个分钟数开始检查是否需要按弱化规则提前平仓。",
+        },
+        {
+            "key": "LONG_WEAK_EXIT_END_MINUTES",
+            "label": "做多观察结束",
+            "type": "number",
+            "value": int(config.long_weak_exit_end_minutes),
+            "min": 0,
+            "step": 1,
+            "unit": "分钟",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做多开仓后，到这个分钟数为止都参与弱化平仓判断。",
+        },
+        {
+            "key": "LONG_WEAK_EXIT_MIN_PEAK_PNL_PCT",
+            "label": "做多最低达标收益率",
+            "type": "number",
+            "value": float(config.long_weak_exit_min_peak_pnl_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做多在观察窗口内，历史最高收益至少达到这个值，才算真正发动成功。",
+        },
+        {
+            "key": "LONG_WEAK_EXIT_SIGNAL_DROP_COUNT",
+            "label": "做多榜单减少个数",
+            "type": "number",
+            "value": int(config.long_weak_exit_signal_drop_count),
+            "min": 1,
+            "step": 1,
+            "unit": "个",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做多开仓后，强烈看多个数比开仓时减少达到这个个数时，满足弱化条件之一。",
+        },
+        {
+            "key": "LONG_WEAK_EXIT_RANK_DROP",
+            "label": "做多排名后移名次",
+            "type": "number",
+            "value": int(config.long_weak_exit_rank_drop),
+            "min": 1,
+            "step": 1,
+            "unit": "名",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做多开仓后，当前排名比开仓时后移到这个名次数，满足弱化条件之一。",
+        },
+        {
+            "key": "SHORT_WEAK_EXIT_START_MINUTES",
+            "label": "做空观察开始",
+            "type": "number",
+            "value": int(config.short_weak_exit_start_minutes),
+            "min": 0,
+            "step": 1,
+            "unit": "分钟",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做空开仓后，从这个分钟数开始检查是否需要按弱化规则提前平仓。",
+        },
+        {
+            "key": "SHORT_WEAK_EXIT_END_MINUTES",
+            "label": "做空观察结束",
+            "type": "number",
+            "value": int(config.short_weak_exit_end_minutes),
+            "min": 0,
+            "step": 1,
+            "unit": "分钟",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做空开仓后，到这个分钟数为止都参与弱化平仓判断。",
+        },
+        {
+            "key": "SHORT_WEAK_EXIT_MIN_PEAK_PNL_PCT",
+            "label": "做空最低达标收益率",
+            "type": "number",
+            "value": float(config.short_weak_exit_min_peak_pnl_pct),
+            "min": 0,
+            "step": 0.1,
+            "unit": "%",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做空在观察窗口内，历史最高收益至少要高于这个值；填 0 表示至少跑出正收益。",
+        },
+        {
+            "key": "SHORT_WEAK_EXIT_SIGNAL_DROP_COUNT",
+            "label": "做空榜单减少个数",
+            "type": "number",
+            "value": int(config.short_weak_exit_signal_drop_count),
+            "min": 1,
+            "step": 1,
+            "unit": "个",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做空开仓后，强烈看空个数比开仓时减少达到这个个数时，满足弱化条件之一。",
+        },
+        {
+            "key": "SHORT_WEAK_EXIT_OPPOSITE_REBOUND_COUNT",
+            "label": "做空对侧回升个数",
+            "type": "number",
+            "value": int(config.short_weak_exit_opposite_rebound_count),
+            "min": 1,
+            "step": 1,
+            "unit": "个",
+            "showWhen": {"key": "ENABLE_POST_ENTRY_WEAK_EXIT"},
+            "detail": "做空开仓后，强烈看多个数比开仓时回升达到这个个数时，满足弱化条件之一。",
+        },
+    ]
+    return (
+        [
+            items[0],
+            toggle,
+            *entry_gate_controls,
+            *imbalance_controls,
+            *position_limit_controls,
+            *risk_controls,
+            *exit_gate_controls,
+            *post_entry_weak_exit_controls,
+            *items[1:],
+        ]
+        if items
+        else [
+            toggle,
+            *entry_gate_controls,
+            *imbalance_controls,
+            *position_limit_controls,
+            *risk_controls,
+            *exit_gate_controls,
+            *post_entry_weak_exit_controls,
+        ]
+    )
 
 
 def _format_unopened_detail(item: dict[str, Any]) -> str | None:
     reason = item.get("reason")
+    if reason == "contract_not_trading":
+        contract_symbol = item.get("contractSymbol") or item.get("asset")
+        contract_status = item.get("contractStatus")
+        if contract_symbol and contract_status:
+            return f"{contract_symbol} 当前状态 {contract_status}"
+        if contract_symbol:
+            return str(contract_symbol)
     if reason == "signal_count_too_low":
         current_count = item.get("currentSignalCount")
         min_required = item.get("minSignalCountToOpen")
         if current_count not in (None, "") and min_required not in (None, ""):
             return f"当前强信号 {current_count} 个，至少需要 {min_required} 个"
+    if reason == "signal_count_entry_gate_blocked":
+        current_count = item.get("currentSignalCount")
+        required_count = item.get("requiredSignalCount")
+        if current_count not in (None, "") and required_count not in (None, ""):
+            return f"当前强信号 {current_count} 个，榜单数量开仓至少需要 {required_count} 个"
     if reason == "trend_not_confirmed":
         close = item.get("close")
         ma = item.get("ma")
@@ -590,6 +1160,9 @@ def _format_unopened_detail(item: dict[str, Any]) -> str | None:
         cooldown_until = item.get("cooldownUntil")
         if cooldown_until not in (None, ""):
             return f"冷却到 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(cooldown_until)))}"
+    detail = item.get("detail")
+    if detail not in (None, ""):
+        return str(detail)
     return None
 
 
@@ -780,8 +1353,6 @@ def _build_risk_stats(
         drawdown = peak - cumulative
         if drawdown > strategy_max_drawdown:
             strategy_max_drawdown = drawdown
-            if peak > 0:
-                strategy_max_drawdown_pct = (drawdown / peak) * Decimal("100")
 
         if value < 0:
             current_loss_streak += 1
@@ -818,6 +1389,20 @@ def _build_risk_stats(
     current_position_value = sum(
         (row.get("currentValueUsdt") or Decimal("0")) for row in positions
     )
+    current_wallet_balance = None
+    if account_snapshot:
+        wallet_balance_raw = account_snapshot.get("totalWalletBalance")
+        if wallet_balance_raw not in (None, ""):
+            try:
+                current_wallet_balance = Decimal(str(wallet_balance_raw))
+            except Exception:
+                current_wallet_balance = None
+    current_unrealized_pct = None
+    if current_wallet_balance not in (None, Decimal("0")):
+        current_unrealized_pct = (current_unrealized / current_wallet_balance) * Decimal("100")
+    max_historical_unrealized_loss = None
+    max_historical_unrealized_loss_pct = None
+    worst_historical_unrealized = None
     stop_loss_pct = Decimal(str(config.stop_loss_pct))
     open_risk_by_side = {LONG: Decimal("0"), SHORT: Decimal("0")}
     for row in positions:
@@ -837,6 +1422,13 @@ def _build_risk_stats(
     account_max_drawdown_pct = None
     current_drawdown = None
     current_drawdown_pct = None
+    initial_equity = None
+    initial_equity_started_at = None
+    min_equity_since_initial = None
+    max_loss_from_initial = None
+    max_loss_from_initial_pct = None
+    current_return_from_initial = None
+    current_return_from_initial_pct = None
     tracking_started_at = None
     tracking_sample_count = 0
 
@@ -845,6 +1437,38 @@ def _build_risk_stats(
         ordered_history = sorted(
             equity_history, key=lambda item: item.get("timestamp", 0)
         )
+        for point in ordered_history:
+            unrealized_raw = point.get("unrealizedPnlUsdt")
+            if unrealized_raw in (None, ""):
+                continue
+            try:
+                unrealized_value = Decimal(str(unrealized_raw))
+            except Exception:
+                continue
+            if worst_historical_unrealized is None or unrealized_value < worst_historical_unrealized:
+                worst_historical_unrealized = unrealized_value
+                max_historical_unrealized_loss_pct = None
+                wallet_balance_raw = point.get("walletBalanceUsdt")
+                if wallet_balance_raw not in (None, ""):
+                    try:
+                        wallet_balance_value = Decimal(str(wallet_balance_raw))
+                        if wallet_balance_value != 0:
+                            max_historical_unrealized_loss_pct = abs(
+                                (unrealized_value / wallet_balance_value) * Decimal("100")
+                            )
+                    except Exception:
+                        max_historical_unrealized_loss_pct = None
+        if worst_historical_unrealized is not None and worst_historical_unrealized < 0:
+            max_historical_unrealized_loss = abs(worst_historical_unrealized)
+        configured_initial_equity = None
+        configured_initial_equity_raw = os.getenv("BASELINE_EQUITY_USDT")
+        if configured_initial_equity_raw not in (None, ""):
+            try:
+                candidate = Decimal(str(configured_initial_equity_raw))
+                if candidate > Decimal("0"):
+                    configured_initial_equity = candidate
+            except Exception:
+                configured_initial_equity = None
         peak_equity = None
         max_drawdown_value = Decimal("0")
         max_drawdown_rate = None
@@ -862,6 +1486,53 @@ def _build_risk_stats(
         account_peak_equity = peak_equity
         account_max_drawdown = max_drawdown_value
         account_max_drawdown_pct = max_drawdown_rate
+
+        baseline_history = ordered_history
+        if configured_initial_equity is not None:
+            baseline_threshold = configured_initial_equity * Decimal("0.99")
+            matched_point = next(
+                (
+                    point
+                    for point in ordered_history
+                    if Decimal(str(point.get("equityUsdt", "0"))) >= baseline_threshold
+                ),
+                None,
+            )
+            if matched_point is not None:
+                initial_equity = configured_initial_equity
+                initial_equity_started_at = matched_point.get("timestamp")
+                baseline_history = [
+                    point
+                    for point in ordered_history
+                    if float(point.get("timestamp", 0) or 0) >= float(initial_equity_started_at or 0)
+                ]
+        if initial_equity is None and ordered_history:
+            first_point = ordered_history[0]
+            initial_equity = Decimal(str(first_point.get("equityUsdt", "0")))
+            initial_equity_started_at = first_point.get("timestamp")
+
+        if baseline_history:
+            min_equity_since_initial = min(
+                Decimal(str(point.get("equityUsdt", "0"))) for point in baseline_history
+            )
+        elif current_equity is not None:
+            min_equity_since_initial = current_equity
+
+        if (
+            initial_equity is not None
+            and min_equity_since_initial is not None
+            and initial_equity > Decimal("0")
+        ):
+            max_loss_from_initial = max(
+                Decimal("0"),
+                initial_equity - min_equity_since_initial,
+            )
+            max_loss_from_initial_pct = (max_loss_from_initial / initial_equity) * Decimal("100")
+            if current_equity is not None:
+                current_return_from_initial = current_equity - initial_equity
+                current_return_from_initial_pct = (
+                    current_return_from_initial / initial_equity
+                ) * Decimal("100")
         if (
             current_equity is not None
             and peak_equity is not None
@@ -869,6 +1540,17 @@ def _build_risk_stats(
         ):
             current_drawdown = peak_equity - current_equity
             current_drawdown_pct = (current_drawdown / peak_equity) * Decimal("100")
+        strategy_peak_equity = None
+        if initial_equity is not None:
+            strategy_peak_equity = initial_equity + peak
+        elif current_wallet_balance is not None:
+            strategy_peak_equity = current_wallet_balance + peak
+        if strategy_peak_equity is not None and strategy_peak_equity > Decimal("0"):
+            strategy_max_drawdown_pct = (
+                strategy_max_drawdown / strategy_peak_equity
+            ) * Decimal("100")
+        elif peak > Decimal("0"):
+            strategy_max_drawdown_pct = (strategy_max_drawdown / peak) * Decimal("100")
 
     return {
         "tradeCount": total_trades,
@@ -890,6 +1572,13 @@ def _build_risk_stats(
         "currentEquityUsdt": str(current_equity) if current_equity is not None else None,
         "currentDrawdownUsdt": str(current_drawdown) if current_drawdown is not None else None,
         "currentDrawdownPct": str(current_drawdown_pct) if current_drawdown_pct is not None else None,
+        "initialEquityUsdt": str(initial_equity) if initial_equity is not None else None,
+        "initialEquityStartedAt": initial_equity_started_at,
+        "minEquitySinceInitialUsdt": str(min_equity_since_initial) if min_equity_since_initial is not None else None,
+        "maxLossFromInitialUsdt": str(max_loss_from_initial) if max_loss_from_initial is not None else None,
+        "maxLossFromInitialPct": str(max_loss_from_initial_pct) if max_loss_from_initial_pct is not None else None,
+        "currentReturnFromInitialUsdt": str(current_return_from_initial) if current_return_from_initial is not None else None,
+        "currentReturnFromInitialPct": str(current_return_from_initial_pct) if current_return_from_initial_pct is not None else None,
         "equityTrackingStartedAt": tracking_started_at,
         "equityTrackingSamples": tracking_sample_count,
         "strategyMaxDrawdownUsdt": str(strategy_max_drawdown),
@@ -897,6 +1586,13 @@ def _build_risk_stats(
         "maxConsecutiveLosses": max_loss_streak,
         "maxConsecutiveWins": max_win_streak,
         "currentUnrealizedPnlUsdt": str(current_unrealized),
+        "currentUnrealizedPnlPct": str(current_unrealized_pct) if current_unrealized_pct is not None else None,
+        "maxHistoricalUnrealizedLossUsdt": str(max_historical_unrealized_loss)
+        if max_historical_unrealized_loss is not None
+        else None,
+        "maxHistoricalUnrealizedLossPct": str(max_historical_unrealized_loss_pct)
+        if max_historical_unrealized_loss_pct is not None
+        else None,
         "currentPositionValueUsdt": str(current_position_value),
         "netRealizedPnlUsdt": str(sum(pnl_values, Decimal("0"))),
         "openRiskUsdt": str(open_risk_total),
@@ -992,6 +1688,8 @@ def _build_recovery_stats(closed_history: list[dict[str, Any]]) -> dict[str, Any
             "netRealizedPnlUsdt": str(net_pnl) if net_pnl is not None else None,
             "finalReturnPct": str(final_return_pct) if final_return_pct is not None else None,
             "reason": event.get("reason"),
+            "stopLossMode": event.get("stopLossMode"),
+            "breakevenActivatedAt": event.get("breakevenActivatedAt"),
             "closeSide": event.get("closeSide"),
             "recoveredToProfit": bool(net_pnl is not None and net_pnl > 0),
         }
@@ -1199,6 +1897,45 @@ def _event_return_pct(event: dict[str, Any], net_pnl: Decimal | None) -> Decimal
     return None
 
 
+ATTRIBUTION_COMPARISON_MIN_CLOSED_TRADES = 6
+ATTRIBUTION_COMPARISON_MIN_GROUP_TRADES = 3
+ENTRY_ACTIONS = {
+    "enter_long",
+    "enter_short",
+}
+
+
+def _strategy_display_name(strategy_id: Any) -> str:
+    if strategy_id == LONG_STRATEGY_ID:
+        return "AI 精选做多"
+    if strategy_id == SHORT_STRATEGY_ID:
+        return "AI 精选做空"
+    return str(strategy_id or "-")
+
+
+def _make_attribution_bucket(label: str | None = None) -> dict[str, Any]:
+    return {
+        "label": label,
+        "tradeCount": 0,
+        "winCount": 0,
+        "lossCount": 0,
+        "netRealizedPnlUsdt": Decimal("0"),
+        "_returnValues": [],
+    }
+
+
+def _touch_attribution_bucket(
+    rows: dict[str, dict[str, Any]],
+    key: Any,
+    *,
+    label: str | None = None,
+) -> dict[str, Any]:
+    row = rows.setdefault(str(key), _make_attribution_bucket(label))
+    if label and not row.get("label"):
+        row["label"] = label
+    return row
+
+
 def _aggregate_attribution_rows(
     rows: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1206,34 +1943,448 @@ def _aggregate_attribution_rows(
     for key, item in rows.items():
         trade_count = int(item["tradeCount"])
         win_count = int(item["winCount"])
-        return_values = item.pop("_returnValues", [])
+        loss_count = int(item["lossCount"])
+        return_values = list(item.get("_returnValues", []))
+        net_pnl = Decimal(str(item["netRealizedPnlUsdt"]))
         avg_return_pct = (
             sum(return_values, Decimal("0")) / Decimal(len(return_values))
             if return_values
             else None
         )
+        avg_net_pnl = net_pnl / Decimal(trade_count) if trade_count else None
+        flat_count = max(trade_count - win_count - loss_count, 0)
         output.append(
             {
                 "key": key,
+                "label": item.get("label"),
                 "tradeCount": trade_count,
                 "winCount": win_count,
-                "lossCount": int(item["lossCount"]),
+                "lossCount": loss_count,
+                "flatCount": flat_count,
                 "winRatePct": str((Decimal(win_count) / Decimal(trade_count)) * Decimal("100"))
                 if trade_count
                 else None,
-                "netRealizedPnlUsdt": str(item["netRealizedPnlUsdt"]),
+                "netRealizedPnlUsdt": str(net_pnl),
+                "avgNetPnlUsdt": str(avg_net_pnl) if avg_net_pnl is not None else None,
                 "avgReturnPct": str(avg_return_pct) if avg_return_pct is not None else None,
             }
         )
-    output.sort(key=lambda item: Decimal(str(item["netRealizedPnlUsdt"])), reverse=True)
+    output.sort(
+        key=lambda item: (
+            Decimal(str(item["netRealizedPnlUsdt"])),
+            Decimal(str(item["avgReturnPct"] or "0")),
+            int(item["tradeCount"]),
+        ),
+        reverse=True,
+    )
     return output
+
+
+def _rank_attribution_rows(
+    rows: list[dict[str, Any]],
+    *,
+    min_trade_count: int,
+    reverse: bool = True,
+) -> list[dict[str, Any]]:
+    scoped = [
+        row
+        for row in rows
+        if int(row.get("tradeCount") or 0) >= int(min_trade_count)
+    ]
+    return sorted(
+        scoped,
+        key=lambda item: (
+            Decimal(str(item.get("netRealizedPnlUsdt") or "0")),
+            Decimal(str(item.get("avgReturnPct") or "0")),
+            int(item.get("tradeCount") or 0),
+        ),
+        reverse=reverse,
+    )
+
+
+def _build_optimality_summary(
+    *,
+    closed_trade_count: int,
+    by_strategy_rows: list[dict[str, Any]],
+    by_entry_hour_rows: list[dict[str, Any]],
+    by_close_reason_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    min_closed_trade_count = ATTRIBUTION_COMPARISON_MIN_CLOSED_TRADES
+    min_group_trade_count = ATTRIBUTION_COMPARISON_MIN_GROUP_TRADES
+    qualified_strategy_rows = _rank_attribution_rows(
+        by_strategy_rows,
+        min_trade_count=min_group_trade_count,
+    )
+    qualified_entry_hour_rows = _rank_attribution_rows(
+        by_entry_hour_rows,
+        min_trade_count=min_group_trade_count,
+    )
+    losing_close_reason_rows = [
+        row
+        for row in _rank_attribution_rows(
+            by_close_reason_rows,
+            min_trade_count=1,
+            reverse=False,
+        )
+        if Decimal(str(row.get("netRealizedPnlUsdt") or "0")) < Decimal("0")
+    ]
+
+    comparison_ready = (
+        closed_trade_count >= min_closed_trade_count
+        and len(qualified_strategy_rows) >= 2
+    )
+    notes: list[str] = []
+    if closed_trade_count < min_closed_trade_count:
+        notes.append(
+            f"当前仅有 {closed_trade_count} 笔已平仓，至少累计到 {min_closed_trade_count} 笔后再判断最优策略更稳。"
+        )
+    if len(qualified_strategy_rows) < 2:
+        notes.append(
+            f"当前达到比较门槛（单组至少 {min_group_trade_count} 笔）的策略不足 2 组，还不能做策略优选结论。"
+        )
+    if comparison_ready:
+        notes.append("已达到初步比较门槛，可以开始做小步参数优化。")
+
+    return {
+        "comparisonReady": comparison_ready,
+        "closedTradeCount": closed_trade_count,
+        "minClosedTradeCount": min_closed_trade_count,
+        "minGroupTradeCount": min_group_trade_count,
+        "qualifiedStrategyCount": len(qualified_strategy_rows),
+        "bestStrategy": qualified_strategy_rows[0] if qualified_strategy_rows else None,
+        "weakestStrategy": qualified_strategy_rows[-1] if len(qualified_strategy_rows) >= 2 else None,
+        "bestEntryHour": qualified_entry_hour_rows[0] if qualified_entry_hour_rows else None,
+        "watchCloseReason": losing_close_reason_rows[0] if losing_close_reason_rows else None,
+        "notes": notes,
+    }
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _entry_signal_counts(side: str, audit: Any) -> tuple[int | None, int | None]:
+    if not isinstance(audit, dict):
+        return (None, None)
+    same_side_count = _int_or_none(audit.get("candidateCount"))
+    opposite_count = _int_or_none(audit.get("oppositeCandidateCount"))
+    if side == SHORT:
+        return (opposite_count, same_side_count)
+    return (same_side_count, opposite_count)
+
+
+def _signal_count_bucket(count: int) -> tuple[str, int]:
+    count = max(int(count or 0), 0)
+    if count <= 5:
+        return ("0-5 个", 0)
+    if count <= 9:
+        return ("6-9 个", 1)
+    if count <= 12:
+        return ("10-12 个", 2)
+    if count <= 15:
+        return ("13-15 个", 3)
+    if count <= 19:
+        return ("16-19 个", 4)
+    if count <= 22:
+        return ("20-22 个", 5)
+    return ("23 个以上", 6)
+
+
+def _make_signal_density_bucket(label: str, order: int) -> dict[str, Any]:
+    bucket = _make_attribution_bucket(label)
+    bucket["order"] = order
+    bucket["_sameCounts"] = []
+    bucket["_oppositeCounts"] = []
+    return bucket
+
+
+def _aggregate_signal_density_rows(
+    rows: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    output = []
+    for key, item in rows.items():
+        trade_count = int(item["tradeCount"])
+        win_count = int(item["winCount"])
+        loss_count = int(item["lossCount"])
+        return_values = list(item.get("_returnValues", []))
+        same_counts = list(item.get("_sameCounts", []))
+        opposite_counts = list(item.get("_oppositeCounts", []))
+        net_pnl = Decimal(str(item["netRealizedPnlUsdt"]))
+        avg_return_pct = (
+            sum(return_values, Decimal("0")) / Decimal(len(return_values))
+            if return_values
+            else None
+        )
+        avg_net_pnl = net_pnl / Decimal(trade_count) if trade_count else None
+        avg_same_count = (
+            sum(same_counts, Decimal("0")) / Decimal(len(same_counts))
+            if same_counts
+            else None
+        )
+        avg_opposite_count = (
+            sum(opposite_counts, Decimal("0")) / Decimal(len(opposite_counts))
+            if opposite_counts
+            else None
+        )
+        flat_count = max(trade_count - win_count - loss_count, 0)
+        output.append(
+            {
+                "key": key,
+                "label": item.get("label") or key,
+                "tradeCount": trade_count,
+                "winCount": win_count,
+                "lossCount": loss_count,
+                "flatCount": flat_count,
+                "winRatePct": str((Decimal(win_count) / Decimal(trade_count)) * Decimal("100"))
+                if trade_count
+                else None,
+                "netRealizedPnlUsdt": str(net_pnl),
+                "avgNetPnlUsdt": str(avg_net_pnl) if avg_net_pnl is not None else None,
+                "avgReturnPct": str(avg_return_pct) if avg_return_pct is not None else None,
+                "avgSameSideCount": str(avg_same_count) if avg_same_count is not None else None,
+                "avgOppositeSideCount": str(avg_opposite_count)
+                if avg_opposite_count is not None
+                else None,
+                "_order": int(item.get("order") or 0),
+            }
+        )
+    output.sort(key=lambda item: (int(item.get("_order") or 0), item.get("label") or ""))
+    for item in output:
+        item.pop("_order", None)
+    return output
+
+
+def _build_entry_event_index(all_history: list[dict[str, Any]]) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    rows: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for event in all_history:
+        if event.get("action") not in ENTRY_ACTIONS:
+            continue
+        side = event.get("side", LONG)
+        strategy_id = str(event.get("strategyId") or "-")
+        for symbol_key in (
+            event.get("contractSymbol"),
+            event.get("asset"),
+        ):
+            if not symbol_key:
+                continue
+            key = (str(symbol_key), side, strategy_id)
+            rows.setdefault(key, []).append(event)
+    for values in rows.values():
+        values.sort(key=lambda item: float(item.get("timestamp", 0) or 0))
+    return rows
+
+
+def _match_entry_event_for_close(
+    event: dict[str, Any],
+    entry_index: dict[tuple[str, str, str], list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    opened_at = event.get("openedAt")
+    if opened_at in (None, ""):
+        return None
+    try:
+        opened_at_value = float(opened_at)
+    except Exception:
+        return None
+    side = event.get("side", LONG)
+    strategy_id = str(event.get("strategyId") or "-")
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for symbol_key in (
+        event.get("contractSymbol"),
+        event.get("asset"),
+    ):
+        if not symbol_key:
+            continue
+        for candidate in entry_index.get((str(symbol_key), side, strategy_id), []):
+            candidate_id = (
+                candidate.get("timestamp"),
+                candidate.get("contractSymbol"),
+                candidate.get("asset"),
+                candidate.get("side"),
+                candidate.get("strategyId"),
+            )
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            candidates.append(candidate)
+    best_match = None
+    best_diff = None
+    for candidate in candidates:
+        try:
+            candidate_ts = float(candidate.get("timestamp", 0) or 0)
+        except Exception:
+            continue
+        diff = abs(candidate_ts - opened_at_value)
+        if diff <= 5 and (best_diff is None or diff < best_diff):
+            best_match = candidate
+            best_diff = diff
+    if best_match is not None:
+        return best_match
+    prior_candidates = []
+    for candidate in candidates:
+        try:
+            candidate_ts = float(candidate.get("timestamp", 0) or 0)
+        except Exception:
+            continue
+        if candidate_ts <= opened_at_value + 5:
+            prior_candidates.append((candidate_ts, candidate))
+    if prior_candidates:
+        prior_candidates.sort(key=lambda item: item[0], reverse=True)
+        return prior_candidates[0][1]
+    return None
+
+
+def _signal_density_side_observation(
+    *,
+    side: str,
+    rows: list[dict[str, Any]],
+    current_count: int,
+    opposite_current_count: int,
+    min_group_trade_count: int,
+) -> dict[str, Any]:
+    current_bucket_label, _ = _signal_count_bucket(current_count)
+    current_bucket_stats = next(
+        (row for row in rows if (row.get("label") or row.get("key")) == current_bucket_label),
+        None,
+    )
+    qualified_rows = _rank_attribution_rows(rows, min_trade_count=min_group_trade_count)
+    best_bucket = qualified_rows[0] if qualified_rows else None
+    signal_label = "强烈看多榜单" if side == LONG else "强烈看空榜单"
+    opposite_label = "强烈看空榜单" if side == LONG else "强烈看多榜单"
+    notes: list[str] = []
+    if current_bucket_stats is None:
+        notes.append(
+            f"当前{signal_label} {current_count} 个，落在 {current_bucket_label}，历史还没有这个分桶的已平仓样本。"
+        )
+    elif int(current_bucket_stats.get("tradeCount") or 0) < min_group_trade_count:
+        notes.append(
+            f"当前{signal_label} {current_count} 个，落在 {current_bucket_label}，该桶目前只有 {current_bucket_stats.get('tradeCount') or 0} 笔已平仓样本，先继续观察。"
+        )
+    else:
+        notes.append(
+            f"当前{signal_label} {current_count} 个，落在 {current_bucket_label}；该桶历史 {current_bucket_stats.get('tradeCount') or 0} 笔，胜率 {current_bucket_stats.get('winRatePct') and _fmt_decimal(Decimal(str(current_bucket_stats.get('winRatePct'))), 2) + '%' or '-'}，均收益 {current_bucket_stats.get('avgReturnPct') and _fmt_decimal(Decimal(str(current_bucket_stats.get('avgReturnPct'))), 2) + '%' or '-'}。"
+        )
+    if best_bucket is not None:
+        notes.append(
+            f"当前历史表现最好的{signal_label}分桶是 {(best_bucket.get('label') or best_bucket.get('key') or '-')}，样本 {best_bucket.get('tradeCount') or 0} 笔，净收益 {_fmt_decimal(Decimal(str(best_bucket.get('netRealizedPnlUsdt') or '0')), 4)} USDT。"
+        )
+    else:
+        notes.append(
+            f"{signal_label}目前还没有达到 {min_group_trade_count} 笔以上样本的有效分桶，暂不下结论。"
+        )
+    return {
+        "side": side,
+        "signalLabel": signal_label,
+        "oppositeSignalLabel": opposite_label,
+        "currentCount": current_count,
+        "oppositeCurrentCount": opposite_current_count,
+        "currentBucket": current_bucket_label,
+        "currentBucketStats": current_bucket_stats,
+        "bestBucket": best_bucket,
+        "rows": rows,
+        "sampleTradeCount": sum(int(row.get("tradeCount") or 0) for row in rows),
+        "notes": notes,
+    }
+
+
+def _build_signal_density_observation(
+    closed_history: list[dict[str, Any]],
+    all_history: list[dict[str, Any]],
+    current_signal_counts: dict[str, int],
+) -> dict[str, Any]:
+    entry_index = _build_entry_event_index(all_history)
+    by_side_bucket_rows: dict[str, dict[str, dict[str, Any]]] = {
+        LONG: {},
+        SHORT: {},
+    }
+    matched_trade_count = 0
+    for event in closed_history:
+        net_pnl = _event_net_pnl(event)
+        if net_pnl is None:
+            continue
+        entry_event = _match_entry_event_for_close(event, entry_index)
+        if not entry_event:
+            continue
+        audit = entry_event.get("audit") or {}
+        if not isinstance(audit, dict):
+            continue
+        try:
+            same_side_count = int(audit.get("candidateCount", 0) or 0)
+        except Exception:
+            continue
+        try:
+            opposite_count = int(audit.get("oppositeCandidateCount", 0) or 0)
+        except Exception:
+            opposite_count = 0
+        side = event.get("side", LONG)
+        bucket_label, bucket_order = _signal_count_bucket(same_side_count)
+        bucket = by_side_bucket_rows[side].setdefault(
+            bucket_label,
+            _make_signal_density_bucket(bucket_label, bucket_order),
+        )
+        bucket["tradeCount"] += 1
+        if net_pnl > 0:
+            bucket["winCount"] += 1
+        elif net_pnl < 0:
+            bucket["lossCount"] += 1
+        bucket["netRealizedPnlUsdt"] += net_pnl
+        return_pct = _event_return_pct(event, net_pnl)
+        if return_pct is not None:
+            bucket["_returnValues"].append(return_pct)
+        bucket["_sameCounts"].append(Decimal(str(same_side_count)))
+        bucket["_oppositeCounts"].append(Decimal(str(opposite_count)))
+        matched_trade_count += 1
+
+    min_group_trade_count = ATTRIBUTION_COMPARISON_MIN_GROUP_TRADES
+    long_rows = _aggregate_signal_density_rows(by_side_bucket_rows[LONG])
+    short_rows = _aggregate_signal_density_rows(by_side_bucket_rows[SHORT])
+    current_long_count = int(current_signal_counts.get(LONG_STRATEGY_ID, 0) or 0)
+    current_short_count = int(current_signal_counts.get(SHORT_STRATEGY_ID, 0) or 0)
+    notes = [
+        "统计口径：按开仓当时的强烈看多/看空榜单数量分桶，只统计已经完整平仓的样本。",
+    ]
+    if matched_trade_count < ATTRIBUTION_COMPARISON_MIN_CLOSED_TRADES:
+        notes.append(
+            f"当前仅回算到 {matched_trade_count} 笔带榜单数量的已平仓样本，结论先作为观察，不做硬规则。"
+        )
+    return {
+        "summary": {
+            "matchedTradeCount": matched_trade_count,
+            "minGroupTradeCount": min_group_trade_count,
+            "currentLongCount": current_long_count,
+            "currentShortCount": current_short_count,
+        },
+        "long": _signal_density_side_observation(
+            side=LONG,
+            rows=long_rows,
+            current_count=current_long_count,
+            opposite_current_count=current_short_count,
+            min_group_trade_count=min_group_trade_count,
+        ),
+        "short": _signal_density_side_observation(
+            side=SHORT,
+            rows=short_rows,
+            current_count=current_short_count,
+            opposite_current_count=current_long_count,
+            min_group_trade_count=min_group_trade_count,
+        ),
+        "notes": notes,
+    }
 
 
 def _build_attribution_stats(
     closed_history: list[dict[str, Any]],
     all_history: list[dict[str, Any]],
+    current_signal_counts: dict[str, int],
 ) -> dict[str, Any]:
     by_asset: dict[str, dict[str, Any]] = {}
+    by_strategy: dict[str, dict[str, Any]] = {}
+    by_entry_reason: dict[str, dict[str, Any]] = {}
     by_reason: dict[str, dict[str, Any]] = {}
     by_hour: dict[str, dict[str, Any]] = {}
     total_hold_seconds = Decimal("0")
@@ -1245,6 +2396,8 @@ def _build_attribution_stats(
             continue
         return_pct = _event_return_pct(event, net_pnl)
         asset_key = event.get("contractSymbol") or event.get("asset") or "-"
+        strategy_key = event.get("strategyId") or "-"
+        entry_reason_key = event.get("entryReason") or "-"
         reason_key = event.get("reason") or "-"
         opened_at = event.get("openedAt") or event.get("timestamp")
         hour_key = "-"
@@ -1253,17 +2406,14 @@ def _build_attribution_stats(
                 hour_key = time.strftime("%H:00", time.localtime(float(opened_at)))
             except Exception:
                 hour_key = "-"
-        for rows, key in ((by_asset, asset_key), (by_reason, reason_key), (by_hour, hour_key)):
-            row = rows.setdefault(
-                str(key),
-                {
-                    "tradeCount": 0,
-                    "winCount": 0,
-                    "lossCount": 0,
-                    "netRealizedPnlUsdt": Decimal("0"),
-                    "_returnValues": [],
-                },
-            )
+        for rows, key, label in (
+            (by_strategy, strategy_key, _strategy_display_name(strategy_key)),
+            (by_entry_reason, entry_reason_key, None),
+            (by_asset, asset_key, None),
+            (by_reason, reason_key, None),
+            (by_hour, hour_key, None),
+        ):
+            row = _touch_attribution_bucket(rows, key, label=label)
             row["tradeCount"] += 1
             if net_pnl > 0:
                 row["winCount"] += 1
@@ -1289,34 +2439,70 @@ def _build_attribution_stats(
         if hold_count
         else None
     )
+    by_strategy_rows = _aggregate_attribution_rows(by_strategy)
+    by_entry_reason_rows = _aggregate_attribution_rows(by_entry_reason)
+    by_asset_rows = _aggregate_attribution_rows(by_asset)
+    by_close_reason_rows = _aggregate_attribution_rows(by_reason)
+    by_entry_hour_rows = _aggregate_attribution_rows(by_hour)
+    closed_trade_count = len(closed_history)
     return {
         "summary": {
-            "closedTradeCount": len(closed_history),
+            "closedTradeCount": closed_trade_count,
             "partialTakeProfitCount": partial_count,
             "avgHoldMinutes": str(avg_hold_minutes) if avg_hold_minutes is not None else None,
         },
-        "byAsset": _aggregate_attribution_rows(by_asset)[:12],
-        "byCloseReason": _aggregate_attribution_rows(by_reason),
-        "byEntryHour": _aggregate_attribution_rows(by_hour),
+        "optimality": _build_optimality_summary(
+            closed_trade_count=closed_trade_count,
+            by_strategy_rows=by_strategy_rows,
+            by_entry_hour_rows=by_entry_hour_rows,
+            by_close_reason_rows=by_close_reason_rows,
+        ),
+        "byStrategy": by_strategy_rows,
+        "byEntryReason": by_entry_reason_rows,
+        "byAsset": by_asset_rows[:12],
+        "byCloseReason": by_close_reason_rows,
+        "byEntryHour": by_entry_hour_rows,
+        "signalDensityObservation": _build_signal_density_observation(
+            closed_history,
+            all_history,
+            current_signal_counts,
+        ),
     }
 
 
 def _build_trade_history_from_close_events(
     close_events: list[dict[str, Any]],
+    realized_events: list[dict[str, Any]] | None = None,
+    all_history: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    merged_events = list(close_events)
+    entry_index = _build_entry_event_index(all_history or [])
+    for event in realized_events or []:
+        if event.get("action") not in PARTIAL_EXIT_ACTIONS:
+            continue
+        merged_events.append(event)
     for event in sorted(
-        close_events,
+        merged_events,
         key=lambda item: item.get("closedAtMs") or item.get("timestamp", 0),
         reverse=True,
     ):
         side = event.get("side", LONG)
+        entry_event = _match_entry_event_for_close(event, entry_index)
+        entry_long_count, entry_short_count = _entry_signal_counts(
+            side,
+            (entry_event or {}).get("audit"),
+        )
         reason = str(event.get("reason") or "").lower()
         order_type = "MARKET"
+        action_label = "平仓"
         if reason in {"liquidation", "force_order"}:
             order_type = "强制平仓"
         elif reason == "adl":
             order_type = "自动减仓(ADL)"
+        elif event.get("action") in PARTIAL_EXIT_ACTIONS or reason == "partial_take_profit":
+            order_type = "部分减仓"
+            action_label = "分批止盈"
         realized_pnl = (
             event.get("netRealizedPnlUsdt")
             if event.get("netRealizedPnlUsdt") not in (None, "")
@@ -1349,7 +2535,7 @@ def _build_trade_history_from_close_events(
                 "asset": event.get("asset"),
                 "side": "SELL" if side == LONG else "BUY",
                 "direction": "做多" if side == LONG else "做空",
-                "action": "平仓",
+                "action": action_label,
                 "type": order_type,
                 "price": event.get("exitPrice"),
                 "quantity": event.get("exitQty") or event.get("quantity"),
@@ -1357,8 +2543,12 @@ def _build_trade_history_from_close_events(
                 "orderId": str(event.get("orderId", "")),
                 "isClose": True,
                 "closeReason": event.get("reason"),
+                "stopLossMode": event.get("stopLossMode"),
+                "breakevenActivatedAt": event.get("breakevenActivatedAt"),
                 "realizedPnlUsdt": realized_pnl,
                 "realizedPnlPct": realized_pnl_pct,
+                "entryStrongLongCount": entry_long_count,
+                "entryStrongShortCount": entry_short_count,
             }
         )
     return items
@@ -1443,10 +2633,12 @@ def _load_history_cache(workdir: Path) -> dict[str, Any]:
 def _save_history_cache(workdir: Path, payload: dict[str, Any]) -> None:
     path = _history_cache_path(workdir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    temp_path = path.with_name(f"{path.name}.{time.time_ns()}.tmp")
+    temp_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    temp_path.replace(path)
 
 
 def _event_time_ms(item: dict[str, Any]) -> int:
@@ -1458,6 +2650,175 @@ def _event_time_ms(item: dict[str, Any]) -> int:
     if timestamp not in (None, ""):
         return int(float(timestamp) * 1000)
     return 0
+
+
+REALIZED_EXIT_ACTIONS = {
+    "exit_long",
+    "exit_short",
+    "partial_exit_long",
+    "partial_exit_short",
+}
+
+FULL_CLOSE_ACTIONS = {
+    "exit_long",
+    "exit_short",
+}
+
+PARTIAL_EXIT_ACTIONS = {
+    "partial_exit_long",
+    "partial_exit_short",
+}
+
+
+def _event_net_pnl_value(event: dict[str, Any]) -> Decimal | None:
+    raw_value = event.get("netRealizedPnlUsdt")
+    if raw_value in (None, ""):
+        raw_value = event.get("realizedPnlUsdt")
+    try:
+        return Decimal(str(raw_value)) if raw_value not in (None, "") else None
+    except Exception:
+        return None
+
+
+def _event_gross_pnl_value(event: dict[str, Any]) -> Decimal | None:
+    raw_value = event.get("realizedPnlUsdt")
+    try:
+        return Decimal(str(raw_value)) if raw_value not in (None, "") else None
+    except Exception:
+        return None
+
+
+def _event_return_basis_value(event: dict[str, Any]) -> Decimal | None:
+    for key in ("returnBasisUsdt", "entryNotionalUsdt"):
+        raw_value = event.get(key)
+        if raw_value in (None, "", 0, "0"):
+            continue
+        try:
+            basis = abs(Decimal(str(raw_value)))
+        except Exception:
+            continue
+        if basis != Decimal("0"):
+            return basis
+    return None
+
+
+def _realized_trade_key(event: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(event.get("contractSymbol") or event.get("asset") or ""),
+        str(event.get("side") or ""),
+        str(event.get("openedAt") or ""),
+        str(event.get("strategyId") or ""),
+    )
+
+
+def _aggregate_closed_trade_history(
+    closed_events: list[dict[str, Any]],
+    realized_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    partials_by_key: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for event in realized_events:
+        if event.get("action") not in PARTIAL_EXIT_ACTIONS:
+            continue
+        partials_by_key.setdefault(_realized_trade_key(event), []).append(event)
+
+    aggregated: list[dict[str, Any]] = []
+    for event in closed_events:
+        merged = dict(event)
+        related_events = sorted(
+            partials_by_key.get(_realized_trade_key(event), []) + [event],
+            key=lambda item: _event_time_ms(item),
+        )
+        gross_realized = sum(
+            (
+                value
+                for value in (_event_gross_pnl_value(item) for item in related_events)
+                if value is not None
+            ),
+            Decimal("0"),
+        )
+        net_realized = sum(
+            (
+                value
+                for value in (_event_net_pnl_value(item) for item in related_events)
+                if value is not None
+            ),
+            Decimal("0"),
+        )
+        return_basis = sum(
+            (
+                value
+                for value in (_event_return_basis_value(item) for item in related_events)
+                if value is not None
+            ),
+            Decimal("0"),
+        )
+        partial_events = related_events[:-1]
+        partial_realized = sum(
+            (
+                value
+                for value in (_event_net_pnl_value(item) for item in partial_events)
+                if value is not None
+            ),
+            Decimal("0"),
+        )
+
+        merged["realizedPnlUsdt"] = str(gross_realized)
+        merged["netRealizedPnlUsdt"] = str(net_realized)
+        if return_basis > Decimal("0"):
+            merged["returnBasisUsdt"] = str(return_basis)
+            merged["entryNotionalUsdt"] = str(return_basis)
+        merged["partialTakeProfitCount"] = len(partial_events)
+        merged["partialRealizedPnlUsdt"] = str(partial_realized)
+        if net_realized > Decimal("0"):
+            merged["closeSide"] = "win"
+        elif net_realized < Decimal("0"):
+            merged["closeSide"] = "loss"
+        else:
+            merged["closeSide"] = "flat"
+        aggregated.append(merged)
+    return aggregated
+
+
+def _build_side_summary(
+    side: str,
+    positions: list[dict[str, Any]],
+    closed_history: list[dict[str, Any]],
+    realized_history: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    scoped_positions = [row for row in positions if row.get("side") == side]
+    scoped_history = [event for event in closed_history if event.get("side") == side]
+    scoped_realized_history = [
+        event for event in (realized_history or closed_history) if event.get("side") == side
+    ]
+    unrealized = sum(
+        (row.get("unrealizedProfit") or Decimal("0")) for row in scoped_positions
+    )
+    position_value = sum(
+        (row.get("currentValueUsdt") or Decimal("0")) for row in scoped_positions
+    )
+    realized = sum(
+        (
+            value
+            for value in (_event_net_pnl_value(event) for event in scoped_realized_history)
+            if value is not None
+        ),
+        Decimal("0"),
+    )
+    return {
+        "side": side,
+        "label": "鍋氬" if side == LONG else "鍋氱┖",
+        "openPositions": len(scoped_positions),
+        "currentValueUsdt": str(position_value),
+        "unrealizedProfit": str(unrealized),
+        "closedCount": len(scoped_history),
+        "closedWinCount": sum(1 for event in scoped_history if event.get("closeSide") == "win"),
+        "closedLossCount": sum(1 for event in scoped_history if event.get("closeSide") == "loss"),
+        "closedFlatCount": sum(1 for event in scoped_history if event.get("closeSide") == "flat"),
+        "realizedPnlUsdt": str(realized),
+        "partialTakeProfitCount": sum(
+            1 for event in scoped_realized_history if event.get("action") in PARTIAL_EXIT_ACTIONS
+        ),
+    }
 
 
 def _merge_force_order_items(
@@ -2129,38 +3490,9 @@ def _record_equity_snapshot(
 ) -> list[dict[str, Any]]:
     history_path = workdir / "runtime" / "account_equity_history.json"
     existing = _load_json(history_path, [])
-    if not isinstance(existing, list):
-        existing = []
-
-    equity = _extract_account_equity(account_snapshot)
-    now = time.time()
-    if equity is not None:
-        last_point = existing[-1] if existing else None
-        should_append = True
-        if last_point:
-            last_ts = float(last_point.get("timestamp", 0) or 0)
-            last_equity = Decimal(str(last_point.get("equityUsdt", "0")))
-            if now - last_ts < 8 and last_equity == equity:
-                should_append = False
-        if should_append:
-            existing.append(
-                {
-                    "timestamp": now,
-                    "equityUsdt": str(equity),
-                    "walletBalanceUsdt": account_snapshot.get("totalWalletBalance")
-                    if account_snapshot
-                    else None,
-                    "unrealizedPnlUsdt": account_snapshot.get("totalUnrealizedProfit")
-                    if account_snapshot
-                    else None,
-                }
-            )
-            existing = existing[-20000:]
-            history_path.write_text(
-                json.dumps(existing, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-    return existing
+    if isinstance(existing, list):
+        return existing
+    return []
 
 
 def _print_terminal_report(report: dict[str, Any]) -> None:
@@ -2198,14 +3530,39 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         for key, value in all_strategy_statuses.items()
         if key in {LONG_STRATEGY_ID, SHORT_STRATEGY_ID}
     }
+    signal_snapshots = {
+        LONG_STRATEGY_ID: _load_signal_snapshot(workdir / "runtime/strong_positive_snapshot.json"),
+        SHORT_STRATEGY_ID: _load_signal_snapshot(workdir / "runtime/strong_negative_snapshot.json"),
+    }
+    strategy_statuses = {
+        key: {
+            **value,
+            "signalSnapshotUpdatedAt": signal_snapshots.get(key, {}).get("updatedAt"),
+            "signalSnapshotCount": signal_snapshots.get(key, {}).get("count", 0),
+            "signalSnapshotItems": signal_snapshots.get(key, {}).get("items", []),
+        }
+        for key, value in strategy_statuses.items()
+    }
     local_positions_by_key = _local_state_positions_by_symbol_side(state)
 
-    closed_history = [
+    all_history = [
         event
         for event in state.get("history", [])
-        if event.get("action") in {"exit_long", "exit_short"}
-        and (not reset_cutoff_ms or _event_time_ms(event) >= reset_cutoff_ms)
+        if not reset_cutoff_ms or _event_time_ms(event) >= reset_cutoff_ms
     ]
+    realized_history = [
+        event
+        for event in all_history
+        if event.get("action") in REALIZED_EXIT_ACTIONS
+    ]
+    closed_history = _aggregate_closed_trade_history(
+        [
+            event
+            for event in realized_history
+            if event.get("action") in FULL_CLOSE_ACTIONS
+        ],
+        realized_history,
+    )
 
     try:
         account_snapshot = broker.get_account_snapshot()
@@ -2219,6 +3576,10 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             if not side:
                 continue
             local_position = local_positions_by_key.get((item.get("symbol"), side), {})
+            entry_long_count, entry_short_count = _entry_signal_counts(
+                side,
+                local_position.get("entryAudit"),
+            )
             quantity = abs(Decimal(str(item.get("positionAmt", "0"))))
             entry_price = Decimal(str(item.get("entryPrice", "0")))
             mark_price = Decimal(str(item.get("markPrice", "0")))
@@ -2255,6 +3616,8 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
                     or ("ISOLATED" if item.get("isolated") else None),
                     "status": "LIVE_TESTNET",
                     "openedAt": local_position.get("openedAt"),
+                    "entryStrongLongCount": entry_long_count,
+                    "entryStrongShortCount": entry_short_count,
                     "stopLossPrice": local_position.get("stopLossPrice"),
                     "stopLossStatus": local_position.get("stopLossStatus"),
                     "stopLossMode": local_position.get("stopLossMode"),
@@ -2272,6 +3635,8 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             }
             if len(values) == 1:
                 return next(iter(values))
+            if len(values) > 1:
+                return "MIXED"
             return None
         account_snapshot = {
             **account_snapshot,
@@ -2299,6 +3664,45 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         source = "local_state"
 
     equity_history = _record_equity_snapshot(workdir, account_snapshot)
+
+    merged_strategy_statuses: dict[str, dict[str, Any]] = {}
+    for key, value in strategy_statuses.items():
+        current_candidate_items = _normalize_signal_rows(value.get("currentCandidateItems", []))
+        snapshot_meta = signal_snapshots.get(key, {})
+        snapshot_items = snapshot_meta.get("items", [])
+        snapshot_count = int(snapshot_meta.get("count", 0) or 0)
+        candidate_count = int(value.get("candidateCount", 0) or 0)
+        merged_strategy_statuses[key] = {
+            **value,
+            "currentCandidateItems": current_candidate_items,
+            "currentCandidateUpdatedAt": value.get("updatedAt"),
+            "signalSnapshotUpdatedAt": snapshot_meta.get("updatedAt"),
+            "signalSnapshotCount": snapshot_count,
+            "signalSnapshotItems": snapshot_items,
+            "signalSnapshotIsProtected": _is_signal_snapshot_protected(
+                current_candidate_items,
+                snapshot_items,
+                candidate_count,
+                snapshot_count,
+            ),
+        }
+    strategy_statuses = merged_strategy_statuses
+    current_signal_counts = {
+        LONG_STRATEGY_ID: int(
+            (strategy_statuses.get(LONG_STRATEGY_ID) or {}).get("candidateCount", 0) or 0
+        ),
+        SHORT_STRATEGY_ID: int(
+            (strategy_statuses.get(SHORT_STRATEGY_ID) or {}).get("candidateCount", 0) or 0
+        ),
+    }
+    runtime_stats = _build_runtime_stats(
+        all_history,
+        equity_history,
+        positions,
+        strategy_statuses,
+        reset_cutoff_ms,
+    )
+    open_frequency = _build_open_frequency(all_history)
 
     positions.sort(key=lambda row: (row.get("side") != LONG, row.get("contractSymbol") or ""))
     trade_history: list[dict[str, Any]] = []
@@ -2353,20 +3757,23 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         force_order_summary = local_force_order_summary
 
     history_for_display = closed_history
-    trade_history = _build_trade_history_from_close_events(closed_history)[:20]
+    trade_history = _build_trade_history_from_close_events(
+        closed_history,
+        realized_history,
+        all_history,
+    )[:20]
     total_realized = sum(
-        Decimal(
-            event.get("netRealizedPnlUsdt")
-            if event.get("netRealizedPnlUsdt") not in (None, "")
-            else event.get("realizedPnlUsdt")
-        )
-        for event in history_for_display
-        if event.get("netRealizedPnlUsdt") not in (None, "") or event.get("realizedPnlUsdt") not in (None, "")
+        (
+            value
+            for value in (_event_net_pnl_value(event) for event in realized_history)
+            if value is not None
+        ),
+        Decimal("0"),
     )
 
     side_summaries = {
-        LONG: _build_side_summary(LONG, positions, history_for_display),
-        SHORT: _build_side_summary(SHORT, positions, history_for_display),
+        LONG: _build_side_summary(LONG, positions, history_for_display, realized_history),
+        SHORT: _build_side_summary(SHORT, positions, history_for_display, realized_history),
     }
 
     winners = sorted(
@@ -2394,6 +3801,8 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             "realizedPnlUsdt": event.get("netRealizedPnlUsdt"),
             "closeSide": event.get("closeSide"),
             "reason": event.get("reason"),
+            "stopLossMode": event.get("stopLossMode"),
+            "breakevenActivatedAt": event.get("breakevenActivatedAt"),
             "status": event.get("status"),
         }
         for event in sorted(closed_history, key=lambda item: item.get("timestamp", 0), reverse=True)[:20]
@@ -2406,26 +3815,32 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         if config.cooldown_minutes % 60 == 0
         else f"{config.cooldown_minutes}分钟"
     )
+    trading_setup = {
+        "longLeverage": account_snapshot.get("longLeverage")
+        if source == "binance_testnet"
+        else str(os.getenv("LEVERAGE", "1")),
+        "shortLeverage": account_snapshot.get("shortLeverage")
+        if source == "binance_testnet"
+        else str(os.getenv("LEVERAGE", "1")),
+        "longMarginMode": account_snapshot.get("longMarginMode")
+        if source == "binance_testnet"
+        else os.getenv("REQUIRED_MARGIN_MODE", "ISOLATED"),
+        "shortMarginMode": account_snapshot.get("shortMarginMode")
+        if source == "binance_testnet"
+        else os.getenv("REQUIRED_MARGIN_MODE", "ISOLATED"),
+    }
+    rule_summary = _apply_live_trading_setup_to_rules(
+        _augment_rule_summary(_build_rule_summary(config), config),
+        config,
+        trading_setup,
+    )
 
     return {
         "source": source,
         "account": account_snapshot,
         "dryRun": config.dry_run,
-        "tradingSetup": {
-            "longLeverage": account_snapshot.get("longLeverage")
-            if source == "binance_testnet"
-            else str(os.getenv("LEVERAGE", "1")),
-            "shortLeverage": account_snapshot.get("shortLeverage")
-            if source == "binance_testnet"
-            else str(os.getenv("LEVERAGE", "1")),
-            "longMarginMode": account_snapshot.get("longMarginMode")
-            if source == "binance_testnet"
-            else os.getenv("REQUIRED_MARGIN_MODE", "ISOLATED"),
-            "shortMarginMode": account_snapshot.get("shortMarginMode")
-            if source == "binance_testnet"
-            else os.getenv("REQUIRED_MARGIN_MODE", "ISOLATED"),
-        },
-        "ruleSummary": _augment_rule_summary(_build_rule_summary(config), config),
+        "tradingSetup": trading_setup,
+        "ruleSummary": rule_summary,
         "productionReadiness": _build_readiness(
             source,
             account_snapshot,
@@ -2442,8 +3857,14 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             equity_history,
             config,
         ),
+        "runtimeStats": runtime_stats,
+        "openFrequency": open_frequency,
         "recoveryStats": _build_recovery_stats(history_for_display),
-        "attributionStats": _build_attribution_stats(history_for_display, state.get("history", [])),
+        "attributionStats": _build_attribution_stats(
+            history_for_display,
+            all_history,
+            current_signal_counts,
+        ),
         "accountCircuitBreaker": state.get("riskState", {}).get("accountCircuitBreaker", {}),
         "summary": {
             "openPositions": len(positions),
@@ -2454,6 +3875,9 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
                 sum((row.get("unrealizedProfit") or Decimal("0")) for row in positions)
             ),
             "realizedPnlUsdt": str(total_realized),
+            "partialTakeProfitCount": sum(
+                1 for event in realized_history if event.get("action") in PARTIAL_EXIT_ACTIONS
+            ),
             "closedCount": len(history_for_display),
             "closedWinCount": sum(1 for event in history_for_display if event.get("closeSide") == "win"),
             "closedLossCount": sum(1 for event in history_for_display if event.get("closeSide") == "loss"),
@@ -2479,6 +3903,8 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
                 "leverage": str(row["leverage"]) if row.get("leverage") is not None else None,
                 "marginMode": row.get("marginMode"),
                 "openedAt": row.get("openedAt"),
+                "entryStrongLongCount": row.get("entryStrongLongCount"),
+                "entryStrongShortCount": row.get("entryStrongShortCount"),
                 "stopLossPrice": row.get("stopLossPrice"),
                 "stopLossStatus": row.get("stopLossStatus"),
                 "stopLossMode": row.get("stopLossMode"),

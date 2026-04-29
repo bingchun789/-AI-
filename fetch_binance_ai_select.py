@@ -1,14 +1,40 @@
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
+from urllib.request import Request, urlopen
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+except ModuleNotFoundError:
+    PlaywrightTimeoutError = TimeoutError
+    sync_playwright = None
 
 
 PAGE_URL = "https://www.binance.com/zh-CN/markets/ai-select"
+ALPHA_AGGREGATE_URL = (
+    "https://www.binance.com/bapi/defi/v1/public/alpha-trade/aggTicker24?dataType=aggregate"
+)
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
 POSITIVE_LABEL_PARTS = ("强烈看多", "寮虹儓鐪嬪", "strong positive")
 NEGATIVE_LABEL_PARTS = ("强烈看空", "寮虹儓鐪嬬┖", "strong negative")
+
+
+POSITIVE_LABEL_PARTS = (*POSITIVE_LABEL_PARTS, "强烈看多")
+NEGATIVE_LABEL_PARTS = (*NEGATIVE_LABEL_PARTS, "强烈看空")
+
+
+def _require_playwright() -> None:
+    if sync_playwright is None:
+        raise ModuleNotFoundError(
+            "playwright is required to fetch live Binance AI Select data. "
+            "Install it in the runtime that executes fetch_binance_ai_select.py."
+        )
 
 
 def _normalize_label(raw: Any) -> str | None:
@@ -18,6 +44,20 @@ def _normalize_label(raw: Any) -> str | None:
     if any(part in text for part in NEGATIVE_LABEL_PARTS):
         return "Strong Negative"
     return None
+
+
+def _normalize_tone_label(raw: Any) -> str | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if text in {"看涨", "看多"} or lowered in {"bullish", "positive"}:
+        return "Bullish"
+    if text in {"看跌", "看空"} or lowered in {"bearish", "negative"}:
+        return "Bearish"
+    if text in {"一般", "中性"} or lowered == "neutral":
+        return "Neutral"
+    return text
 
 
 def _is_address_style_asset(asset: str) -> bool:
@@ -77,20 +117,63 @@ def _build_sentiment_item(
     rank: int | None,
     score_label: str,
     asset_type: str = "SPOT",
+    *,
+    include_metrics: bool = True,
+    score_value: Any = None,
+    fallback_score: bool = True,
+    news_label: Any = None,
+    social_label: Any = None,
+    kol_label: Any = None,
 ) -> dict[str, Any]:
-    score_value = "7.0" if score_label == "Strong Positive" else "2.0"
-    return {
+    item = {
         "rank": rank,
         "asset": asset,
         "baseAsset": asset,
         "assetType": asset_type,
-        "metrics": {
+    }
+    if include_metrics:
+        normalized_score = score_value
+        if normalized_score in (None, "") and fallback_score:
+            normalized_score = "7.0" if score_label == "Strong Positive" else "2.0"
+        metrics = {
             "sentiment_score": {
-                "value": score_value,
                 "valueLabel": score_label,
             }
-        },
-    }
+        }
+        if normalized_score not in (None, ""):
+            metrics["sentiment_score"]["value"] = str(normalized_score)
+        if news_label not in (None, ""):
+            metrics["sentiment_score_news"] = {"valueLabel": str(news_label)}
+        if social_label not in (None, ""):
+            metrics["sentiment_score_social"] = {"valueLabel": str(social_label)}
+        if kol_label not in (None, ""):
+            metrics["sentiment_score_kol"] = {"valueLabel": str(kol_label)}
+        item["metrics"] = metrics
+    return item
+
+
+def _merge_sentiment_items(existing: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in overlay.items():
+        if value in (None, "", [], {}):
+            continue
+        if key == "metrics" and isinstance(value, dict):
+            current_metrics = merged.get("metrics", {}) if isinstance(merged.get("metrics"), dict) else {}
+            next_metrics = dict(current_metrics)
+            for metric_key, metric_value in value.items():
+                if metric_value in (None, "", [], {}):
+                    continue
+                if isinstance(metric_value, dict) and isinstance(next_metrics.get(metric_key), dict):
+                    next_metrics[metric_key] = {
+                        **next_metrics[metric_key],
+                        **{k: v for k, v in metric_value.items() if v not in (None, "")},
+                    }
+                else:
+                    next_metrics[metric_key] = metric_value
+            merged["metrics"] = next_metrics
+            continue
+        merged[key] = value
+    return merged
 
 
 def _extract_sentiment_items_from_payload(payload: Any) -> list[dict[str, Any]]:
@@ -123,6 +206,10 @@ def _extract_sentiment_items_from_payload(payload: Any) -> list[dict[str, Any]]:
                         rank=node.get("rank"),
                         score_label=score_label,
                         asset_type=str(asset_type).upper(),
+                        score_value=sentiment_score.get("value"),
+                        news_label=metrics.get("sentiment_score_news", {}).get("valueLabel"),
+                        social_label=metrics.get("sentiment_score_social", {}).get("valueLabel"),
+                        kol_label=metrics.get("sentiment_score_kol", {}).get("valueLabel"),
                     )
                 )
             for value in node.values():
@@ -168,7 +255,7 @@ def _merge_items(
         normalized_item = dict(item)
         normalized_item["asset"] = asset
         normalized_item["baseAsset"] = asset
-        merged[asset] = normalized_item
+        merged[asset] = _merge_sentiment_items(merged.get(asset, {}), normalized_item)
 
     for item in preferred:
         asset = _normalize_asset_code(item.get("asset"))
@@ -177,7 +264,10 @@ def _merge_items(
         normalized_item = dict(item)
         normalized_item["asset"] = asset
         normalized_item["baseAsset"] = asset
-        merged[asset] = normalized_item
+        if asset in merged:
+            merged[asset] = _merge_sentiment_items(normalized_item, merged[asset])
+        else:
+            merged[asset] = normalized_item
 
     rows = list(merged.values())
     if score_label == "Strong Positive":
@@ -253,28 +343,25 @@ def _build_alpha_symbol_map(captured_payloads: list[dict[str, Any]]) -> dict[str
 
 def _open_page(page) -> None:
     page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(5000)
     try:
-        page.wait_for_function(
-            """
-            () => {
-              const bodyText = (document.body && document.body.innerText) || '';
-              return bodyText.includes('强烈看多')
-                || bodyText.includes('强烈看空')
-                || bodyText.includes('寮虹儓鐪嬪')
-                || bodyText.includes('寮虹儓鐪嬬┖');
-            }
-            """,
-            timeout=15000,
-        )
+        page.wait_for_load_state("networkidle", timeout=20000)
     except PlaywrightTimeoutError:
-        page.wait_for_timeout(3000)
+        pass
+    try:
+        _wait_for_rendered_table(page)
+    except PlaywrightTimeoutError:
+        page.wait_for_timeout(5000)
+        _wait_for_rendered_table(page)
 
 
 def _scrape_visible_sentiment_rows(page) -> list[dict[str, Any]]:
     return page.evaluate(
         """
         () => {
+          const countMatches = (text, pattern) => {
+            const matches = text.match(pattern);
+            return matches ? matches.length : 0;
+          };
           const hasPositive = (text) =>
             text.includes('强烈看多')
             || text.includes('寮虹儓鐪嬪')
@@ -289,25 +376,34 @@ def _scrape_visible_sentiment_rows(page) -> list[dict[str, Any]]:
           for (const node of nodes) {
             const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
             if (!text || text.length > 500) continue;
+            const signalCount =
+              countMatches(text, /寮虹儓鐪嬪|瀵櫣鍎撻惇瀣樋|strong positive/ig)
+              + countMatches(text, /寮虹儓鐪嬬┖|瀵櫣鍎撻惇瀣敄|strong negative/ig);
+            if (signalCount !== 1) continue;
 
             let scoreLabel = null;
             if (hasPositive(text)) scoreLabel = 'Strong Positive';
             else if (hasNegative(text)) scoreLabel = 'Strong Negative';
             if (!scoreLabel) continue;
 
-            const rankMatch = text.match(/(?:^|\\s)(\\d{1,4})(?:\\s|$)/);
-            const assetMatches = text.match(/\\b[A-Z][A-Z0-9]{1,19}\\b/g) || [];
-            const asset =
-              assetMatches.find((value) => value !== 'ALPHA' && !value.startsWith('0X'))
-              || assetMatches.find((value) => value !== 'ALPHA')
-              || assetMatches[0];
+            const leadMatch = text.match(/^\\s*(?:(\\d{1,4})\\s+)?([A-Z][A-Z0-9]{1,19}|[\\u4e00-\\u9fff]{1,12})\\s+\\$/);
+            if (!leadMatch) continue;
+            const asset = leadMatch[2];
             if (!asset) continue;
+            const scoreMatch = text.match(/([0-9]+(?:\\.[0-9]+)?)\\s+(?:寮虹儓鐪嬪|寮虹儓鐪嬬┖|瀵櫣鍎撻惇瀣樋|瀵櫣鍎撻惇瀣敄|strong positive|strong negative)/i);
+            const newsMatch = text.match(/(?:鏂伴椈|新闻|News)\\s+([A-Za-z\\u4e00-\\u9fff]+)/i);
+            const socialMatch = text.match(/(?:绀句氦鎯呯华|社交情绪|Social Sentiment)\\s+([A-Za-z\\u4e00-\\u9fff]+)/i);
+            const kolMatch = text.match(/(?:KOL)\\s+([A-Za-z\\u4e00-\\u9fff]+)/i);
 
             const item = {
               asset,
-              rank: rankMatch ? Number(rankMatch[1]) : null,
+              rank: leadMatch[1] ? Number(leadMatch[1]) : null,
               scoreLabel,
               assetType: /alpha/i.test(text) ? 'ALPHA' : 'SPOT',
+              score: scoreMatch ? Number(scoreMatch[1]) : null,
+              newsLabel: newsMatch ? newsMatch[1] : null,
+              socialLabel: socialMatch ? socialMatch[1] : null,
+              kolLabel: kolMatch ? kolMatch[1] : null,
               rawTexts: [text],
             };
             const key = `${item.scoreLabel}|${item.rank ?? 'na'}|${item.asset}`;
@@ -359,111 +455,332 @@ def _go_to_page(page, target_page: int) -> bool:
     return bool(clicked)
 
 
+def _fetch_alpha_token_map() -> dict[str, dict[str, Any]]:
+    request = Request(ALPHA_AGGREGATE_URL, headers={"User-Agent": USER_AGENT})
+    with urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    token_map: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        token_id = str(row.get("tokenId") or "").strip().upper()
+        if token_id:
+            token_map[token_id] = row
+    return token_map
+
+
+def _wait_for_rendered_table(page, previous_first_rank: int | None = None) -> None:
+    page.wait_for_function(
+        """
+        (previousFirstRank) => {
+          const rows = Array.from(document.querySelectorAll('table tr'))
+            .filter((tr) => tr.querySelectorAll('td').length >= 8);
+          if (!rows.length) return false;
+          const firstRowCells = Array.from(rows[0].querySelectorAll('td'));
+          const firstRank = Number((firstRowCells[1]?.innerText || '').trim());
+          const labelText = (firstRowCells[2]?.innerText || '').trim();
+          const hasSignalLabel = /强烈看多|强烈看空|看多|看空|strong positive|strong negative/i.test(labelText);
+          if (!Number.isFinite(firstRank) || !hasSignalLabel) return false;
+          if (previousFirstRank == null) return true;
+          return firstRank !== previousFirstRank;
+        }
+        """,
+        arg=previous_first_rank,
+        timeout=20000,
+    )
+
+
+def _current_first_rank(page) -> int | None:
+    value = page.evaluate(
+        """
+        () => {
+          const row = Array.from(document.querySelectorAll('table tr'))
+            .find((tr) => tr.querySelectorAll('td').length >= 8);
+          if (!row) return null;
+          const rank = Number((row.querySelectorAll('td')[1]?.innerText || '').trim());
+          return Number.isFinite(rank) ? rank : null;
+        }
+        """
+    )
+    return int(value) if value is not None else None
+
+
+def _go_to_rendered_page(page, target_page: int) -> bool:
+    previous_first_rank = _current_first_rank(page)
+    clicked = page.evaluate(
+        """
+        (targetPage) => {
+          const target = String(targetPage);
+          const elements = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+          const match = elements.find((el) => (el.textContent || '').trim() === target);
+          if (!match) return false;
+          match.click();
+          return true;
+        }
+        """,
+        target_page,
+    )
+    if clicked:
+        try:
+            _wait_for_rendered_table(page, previous_first_rank)
+        except PlaywrightTimeoutError:
+            page.wait_for_timeout(3000)
+    return bool(clicked)
+
+
+def _extract_rendered_table_rows(page) -> list[dict[str, Any]]:
+    return page.evaluate(
+        """
+        () => {
+          const tokenPattern = /token\\/logos\\/([A-Za-z0-9]+)\\.png/i;
+          return Array.from(document.querySelectorAll('table tr'))
+            .filter((tr) => tr.querySelectorAll('td').length >= 8)
+            .map((tr) => {
+              const cells = Array.from(tr.querySelectorAll('td'))
+                .map((cell) => (cell.innerText || '').replace(/\\s+/g, ' ').trim());
+              const assetHtml = tr.querySelector('td')?.innerHTML || '';
+              const tokenMatch = assetHtml.match(tokenPattern);
+              return {
+                assetText: cells[0] || '',
+                rank: Number(cells[1] || ''),
+                scoreLabel: cells[2] || '',
+                priceText: cells[3] || '',
+                socialVolumeText: cells[4] || '',
+                socialLabel: cells[5] || '',
+                newsLabel: cells[6] || '',
+                kolLabel: cells[7] || '',
+                tokenId: tokenMatch ? tokenMatch[1].toUpperCase() : null,
+                rowText: (tr.innerText || '').replace(/\\s+/g, ' ').trim(),
+              };
+            })
+            .filter((row) => Number.isFinite(row.rank) && row.assetText && row.scoreLabel);
+        }
+        """
+    )
+
+
+def _split_rendered_asset_text(raw: Any) -> tuple[str, str]:
+    text = str(raw or "").strip()
+    if text.endswith(" Alpha"):
+        return text[:-6].strip(), "ALPHA"
+    return text, "SPOT"
+
+
+def _resolve_rendered_asset_code(
+    display_asset: str,
+    asset_type: str,
+    token_id: str | None,
+    alpha_token_map: dict[str, dict[str, Any]],
+) -> str:
+    if asset_type != "ALPHA":
+        return _normalize_asset_code(display_asset)
+    alpha_meta = alpha_token_map.get(str(token_id or "").upper(), {})
+    candidates = [
+        display_asset,
+        alpha_meta.get("cexCoinName"),
+        alpha_meta.get("symbol"),
+        alpha_meta.get("name"),
+    ]
+    for candidate in candidates:
+        normalized = _normalize_asset_code(candidate)
+        if _looks_like_asset_code(normalized):
+            return normalized
+    return display_asset
+
+
+def _fetch_assets_payload_from_page(page, interval: str) -> dict[str, Any]:
+    return page.evaluate(
+        """
+        async (apiPath) => {
+          const response = await fetch(apiPath, { credentials: 'include' });
+          return {
+            ok: response.ok,
+            status: response.status,
+            json: await response.json(),
+          };
+        }
+        """,
+        build_api_path("assets", interval),
+    )
+
+
+def _build_rendered_score_lookup(payload: dict[str, Any]) -> dict[str, Any]:
+    items = payload.get("json", {}).get("data", {}).get("items", [])
+    lookup: dict[str, Any] = {}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        metrics = item.get("metrics", {}) if isinstance(item.get("metrics"), dict) else {}
+        score = metrics.get("sentiment_score", {}) if isinstance(metrics.get("sentiment_score"), dict) else {}
+        value = score.get("value")
+        if value in (None, ""):
+            continue
+        rank = item.get("rank")
+        asset = _normalize_asset_code(item.get("baseAsset") or item.get("asset"))
+        if rank not in (None, ""):
+            lookup[f"rank:{int(rank)}"] = value
+            if asset:
+                lookup[f"rank_asset:{int(rank)}:{asset}"] = value
+        if asset:
+            lookup[f"asset:{asset}"] = value
+    return lookup
+
+
+def _lookup_rendered_score(
+    *,
+    rank: int,
+    resolved_asset: str,
+    display_asset: str,
+    score_lookup: dict[str, Any],
+) -> Any:
+    resolved = _normalize_asset_code(resolved_asset)
+    display = _normalize_asset_code(display_asset)
+    for key in (
+        f"rank_asset:{rank}:{resolved}",
+        f"rank_asset:{rank}:{display}",
+        f"rank:{rank}",
+        f"asset:{resolved}",
+        f"asset:{display}",
+    ):
+        value = score_lookup.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _build_item_from_rendered_row(
+    row: dict[str, Any],
+    alpha_token_map: dict[str, dict[str, Any]],
+    score_lookup: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    rank = row.get("rank")
+    if rank in (None, ""):
+        return None
+    rank_int = int(rank)
+    score_label = _normalize_label(row.get("scoreLabel"))
+    if not score_label:
+        return None
+    display_asset, asset_type = _split_rendered_asset_text(row.get("assetText"))
+    resolved_asset = _resolve_rendered_asset_code(
+        display_asset=display_asset,
+        asset_type=asset_type,
+        token_id=row.get("tokenId"),
+        alpha_token_map=alpha_token_map,
+    )
+    score_value = _lookup_rendered_score(
+        rank=rank_int,
+        resolved_asset=resolved_asset,
+        display_asset=display_asset,
+        score_lookup=score_lookup or {},
+    )
+    item = _build_sentiment_item(
+        asset=resolved_asset,
+        rank=rank_int,
+        score_label=score_label,
+        asset_type=asset_type,
+        score_value=score_value,
+        fallback_score=False,
+        news_label=_normalize_tone_label(row.get("newsLabel")),
+        social_label=_normalize_tone_label(row.get("socialLabel")),
+        kol_label=_normalize_tone_label(row.get("kolLabel")),
+    )
+    item["sourceRank"] = rank_int
+    item["displayAsset"] = display_asset
+    if row.get("tokenId"):
+        item["tokenId"] = str(row.get("tokenId")).upper()
+    return item
+
+
 def fetch_rendered_signal_lists(interval: str, debug_targets: list[str] | None = None) -> dict[str, Any]:
-    del interval
+    _require_playwright()
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(
             locale="zh-CN",
+            viewport={"width": 1920, "height": 5000},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/122.0.0.0 Safari/537.36"
             ),
         )
-        captured_payloads: list[dict[str, Any]] = []
-        is_closing = False
-
-        def handle_response(response) -> None:
-            nonlocal is_closing
-            if is_closing:
-                return
-            url = response.url
-            if "binance.com" not in url and "/bapi/" not in url:
-                return
-            try:
-                payload = response.json()
-            except BaseException:
-                return
-            captured_payloads.append({"url": url, "payload": payload})
-
-        page.on("response", handle_response)
         _open_page(page)
 
-        all_page_rows = list(_scrape_visible_sentiment_rows(page))
-        debug_targets_upper = {target.strip().upper() for target in (debug_targets or []) if target.strip()}
-
+        debug_targets_upper = {
+            target.strip().upper() for target in (debug_targets or []) if target.strip()
+        }
+        alpha_token_map = _fetch_alpha_token_map()
+        assets_payload = _fetch_assets_payload_from_page(page, interval)
+        score_lookup = _build_rendered_score_lookup(assets_payload)
         last_page = _find_last_page_number(page)
-        if last_page > 1:
-            for page_number in range(2, last_page + 1):
-                if not _go_to_page(page, page_number):
+        scanned_pages: list[int] = []
+        rendered_rows: list[dict[str, Any]] = []
+
+        def collect_current_page(page_number: int) -> list[dict[str, Any]]:
+            rows = _extract_rendered_table_rows(page)
+            for row in rows:
+                row["page"] = page_number
+            scanned_pages.append(page_number)
+            rendered_rows.extend(rows)
+            return rows
+
+        # Strong longs are at the front of the rank table. Stop after the first
+        # front page that no longer contains strong-long rows, with a small cap
+        # so a bad pagination state cannot make a trading cycle crawl forever.
+        current_page_number = 1
+        for page_number in range(1, min(last_page, 6) + 1):
+            if page_number != current_page_number:
+                if not _go_to_rendered_page(page, page_number):
                     continue
-                all_page_rows.extend(_scrape_visible_sentiment_rows(page))
+                current_page_number = page_number
+            rows = collect_current_page(page_number)
+            if page_number > 1 and not any(
+                _normalize_label(row.get("scoreLabel")) == "Strong Positive" for row in rows
+            ):
+                break
 
-        positive_dom_items = [
-            _build_sentiment_item(
-                row["asset"],
-                row.get("rank"),
-                "Strong Positive",
-                row.get("assetType", "SPOT"),
-            )
-            for row in all_page_rows
-            if row.get("scoreLabel") == "Strong Positive"
-        ]
+        # Strong shorts are at the tail of the rank table. Scan backward from
+        # the last page and stop once the current tail edge has been covered.
+        tail_start = max(1, last_page - 5)
+        for page_number in range(last_page, tail_start - 1, -1):
+            if page_number != current_page_number:
+                if not _go_to_rendered_page(page, page_number):
+                    continue
+                current_page_number = page_number
+            rows = collect_current_page(page_number)
+            if page_number < last_page and not any(
+                _normalize_label(row.get("scoreLabel")) == "Strong Negative" for row in rows
+            ):
+                break
 
-        negative_dom_items = [
-            _build_sentiment_item(
-                row["asset"],
-                row.get("rank"),
-                "Strong Negative",
-                row.get("assetType", "SPOT"),
-            )
-            for row in all_page_rows
-            if row.get("scoreLabel") == "Strong Negative"
-        ]
-
-        extracted_from_api: list[dict[str, Any]] = []
-        extracted_urls: list[str] = []
-        debug_matches: list[dict[str, Any]] = []
-        for item in captured_payloads:
-            extracted_items = _extract_sentiment_items_from_payload(item["payload"])
-            extracted_from_api.extend(extracted_items)
-            extracted_urls.extend([item["url"]] * len(extracted_items))
+        positive_by_key: dict[str, dict[str, Any]] = {}
+        negative_by_key: dict[str, dict[str, Any]] = {}
+        row_matches: list[dict[str, Any]] = []
+        for row in rendered_rows:
+            item = _build_item_from_rendered_row(row, alpha_token_map, score_lookup)
+            if not item:
+                continue
+            key = f"{item.get('sourceRank') or item.get('rank')}|{item.get('displayAsset') or item.get('asset')}"
+            label = item.get("metrics", {}).get("sentiment_score", {}).get("valueLabel")
+            if label == "Strong Positive":
+                positive_by_key[key] = item
+            elif label == "Strong Negative":
+                negative_by_key[key] = item
             if debug_targets_upper:
-                for match in _collect_string_matches(item["payload"], debug_targets_upper):
-                    debug_matches.append(
-                        {
-                            "url": item["url"],
-                            **match,
-                        }
-                    )
+                text = f"{row.get('assetText', '')} {row.get('rowText', '')}".upper()
+                if any(target in text for target in debug_targets_upper):
+                    row_matches.append(row)
 
-        alpha_symbol_map = _build_alpha_symbol_map(captured_payloads)
+        positive_items = sorted(
+            positive_by_key.values(),
+            key=lambda item: (item.get("sourceRank") or item.get("rank") or 999999),
+        )
+        negative_items = sorted(
+            negative_by_key.values(),
+            key=lambda item: -(item.get("sourceRank") or item.get("rank") or 0),
+        )
 
-        normalized_extracted: list[dict[str, Any]] = []
-        for item in extracted_from_api:
-            normalized_item = dict(item)
-            asset = _normalize_asset_code(normalized_item.get("asset"))
-            if asset in alpha_symbol_map:
-                normalized_item["asset"] = alpha_symbol_map[asset]
-                normalized_item["baseAsset"] = alpha_symbol_map[asset]
-                if str(normalized_item.get("assetType") or "").upper() == "ALPHA":
-                    normalized_item["assetType"] = "ALPHA"
-            normalized_extracted.append(normalized_item)
-
-        positive_items = _merge_items(positive_dom_items, normalized_extracted, "Strong Positive")
-        negative_items = _merge_items(negative_dom_items, normalized_extracted, "Strong Negative")
-
-        dom_matches = []
-        if debug_targets_upper:
-            for row in all_page_rows:
-                row_text = " ".join(row.get("rawTexts", []))
-                upper_text = row_text.upper()
-                if any(target in upper_text for target in debug_targets_upper):
-                    dom_matches.append(row)
-
-        is_closing = True
-        page.remove_listener("response", handle_response)
         browser.close()
         return {
             "ok": True,
@@ -475,13 +792,14 @@ def fetch_rendered_signal_lists(interval: str, debug_targets: list[str] | None =
                     "negativeItems": negative_items,
                     "positiveCount": len(positive_items),
                     "negativeCount": len(negative_items),
-                    "source": "rendered_page",
-                    "capturedApiCount": len(captured_payloads),
-                    "alphaSymbolMapCount": len(alpha_symbol_map),
+                    "source": "rendered_table",
+                    "lastPage": last_page,
+                    "scannedPages": scanned_pages,
+                    "scannedRowCount": len(rendered_rows),
+                    "alphaTokenMapCount": len(alpha_token_map),
+                    "scoreLookupCount": len(score_lookup),
                     "debugTargets": sorted(debug_targets_upper),
-                    "domMatches": dom_matches,
-                    "apiStringMatches": debug_matches[:100],
-                    "extractedSourceMap": _build_source_map(normalized_extracted, extracted_urls),
+                    "rowMatches": row_matches[:100],
                 },
             },
         }
@@ -500,6 +818,7 @@ def build_api_path(dataset: str, interval: str) -> str:
 
 
 def fetch_dataset(dataset: str, interval: str) -> dict[str, Any]:
+    _require_playwright()
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(

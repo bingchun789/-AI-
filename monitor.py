@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -44,6 +46,40 @@ SNAPSHOT_PRESERVED_RE = re.compile(
     r"signal_snapshot_preserved side=(?P<side>LONG|SHORT) previous=(?P<previous>\d+) current=(?P<current>\d+)"
 )
 
+MONITOR_SERVICE_SPECS = {
+    "bot": {
+        "label": "交易机器人",
+        "service": "ai-select-bot.service",
+    },
+    "dashboard": {
+        "label": "看板服务",
+        "service": "ai-select-dashboard.service",
+    },
+    "monitor": {
+        "label": "巡检服务",
+        "service": "ai-select-monitor.service",
+    },
+}
+
+AUTO_REPAIR_TRIGGER_RULES = {
+    "bot": {
+        "bot_log_missing",
+        "bot_success_missing",
+        "bot_loop_stale",
+        "strategy_status_missing",
+        "strategy_status_stale",
+    },
+    "dashboard": {
+        "dashboard_health_failed",
+        "dashboard_cache_stale",
+    },
+}
+
+AUTO_REPAIR_ARTIFACT_KEYS = {
+    "bot": {"botLog", "strategyStatuses", "stateFile", "positiveSnapshot", "negativeSnapshot"},
+    "dashboard": {"dashboardCache"},
+}
+
 
 def _load_json(path: Path, default: Any) -> Any:
     if not path.exists():
@@ -54,15 +90,24 @@ def _load_json(path: Path, default: Any) -> Any:
         return default
 
 
-def _write_json(path: Path, payload: Any) -> None:
+def _write_text_atomic(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f"{path.name}.{time.time_ns()}.tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    temp_path.replace(path)
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    _write_text_atomic(
+        path,
+        json.dumps(_json_safe_value(payload), ensure_ascii=False, indent=2),
+    )
 
 
 def _append_jsonl(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        handle.write(json.dumps(_json_safe_value(payload), ensure_ascii=False) + "\n")
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -72,6 +117,78 @@ def _to_decimal(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except Exception:
         return None
+
+
+def _event_side(event: dict[str, Any]) -> str | None:
+    side = str(event.get("side") or "").upper()
+    return side if side in {LONG, SHORT} else None
+
+
+def _event_quantity(event: dict[str, Any]) -> Decimal | None:
+    quantity = _to_decimal(event.get("quantity"))
+    if quantity is not None and quantity > Decimal("0"):
+        return abs(quantity)
+    entry_notional = _to_decimal(event.get("entryNotionalUsdt"))
+    entry_price = _to_decimal(event.get("entryPrice"))
+    if entry_notional is None or entry_price in (None, Decimal("0")):
+        return None
+    return abs(entry_notional / entry_price)
+
+
+def _event_pnl_pct_for_price(
+    event: dict[str, Any], price: Decimal | None
+) -> Decimal | None:
+    side = _event_side(event)
+    entry_price = _to_decimal(event.get("entryPrice"))
+    return_basis = _to_decimal(event.get("returnBasisUsdt"))
+    quantity = _event_quantity(event)
+    if (
+        side not in {LONG, SHORT}
+        or price is None
+        or entry_price is None
+        or quantity in (None, Decimal("0"))
+        or return_basis in (None, Decimal("0"))
+    ):
+        return None
+    if side == SHORT:
+        pnl = (entry_price - price) * quantity
+    else:
+        pnl = (price - entry_price) * quantity
+    return (pnl / return_basis) * Decimal("100")
+
+
+def _is_protective_breakeven_stop(
+    event: dict[str, Any], audit: dict[str, Any]
+) -> bool:
+    side = _event_side(event)
+    entry_price = _to_decimal(event.get("entryPrice"))
+    configured_stop_price = _to_decimal(audit.get("configuredStopLossPrice"))
+    if side not in {LONG, SHORT} or entry_price is None or configured_stop_price is None:
+        return False
+    if side == SHORT:
+        return configured_stop_price <= entry_price
+    return configured_stop_price >= entry_price
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, set):
+        return [_json_safe_value(item) for item in sorted(value, key=lambda item: str(item))]
+    return value
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _fmt_ts(ts: float | None) -> str | None:
@@ -204,6 +321,14 @@ def _load_monitor_runtime_state(path: Path) -> dict[str, Any]:
         state["fingerprints"] = {}
     if not isinstance(state.get("exitCandidates"), dict):
         state["exitCandidates"] = {}
+    auto_repair = state.get("autoRepair")
+    if not isinstance(auto_repair, dict):
+        auto_repair = {}
+    if not isinstance(auto_repair.get("services"), dict):
+        auto_repair["services"] = {}
+    if not isinstance(auto_repair.get("recentActions"), list):
+        auto_repair["recentActions"] = []
+    state["autoRepair"] = auto_repair
     return state
 
 
@@ -225,16 +350,245 @@ def _monitor_paths(workdir: Path) -> dict[str, Path]:
     }
 
 
-def _issue_fingerprint(issue: dict[str, Any]) -> str:
-    stable = {
-        "level": issue.get("level"),
-        "rule": issue.get("rule"),
-        "title": issue.get("title"),
-        "detail": issue.get("detail"),
-        "context": issue.get("context") or {},
+def _systemctl_path() -> str | None:
+    return shutil.which("systemctl")
+
+
+def _service_status(service_name: str) -> dict[str, Any]:
+    systemctl = _systemctl_path()
+    result = {
+        "checked": bool(systemctl),
+        "service": service_name,
+        "active": False,
+        "status": "unavailable" if not systemctl else None,
+        "error": None,
     }
+    if not systemctl:
+        result["error"] = "systemctl unavailable"
+        return result
+    try:
+        proc = subprocess.run(
+            [systemctl, "is-active", service_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        status = (proc.stdout or proc.stderr or "").strip() or "unknown"
+        result["status"] = status
+        result["active"] = status == "active"
+        if proc.returncode != 0 and not result["active"]:
+            result["error"] = status
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+    return result
+
+
+def _inspect_services(
+    *,
+    issues: list[dict[str, Any]],
+    now: float,
+) -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    for key, spec in MONITOR_SERVICE_SPECS.items():
+        item = _service_status(spec["service"])
+        item["label"] = spec["label"]
+        results[key] = item
+        if item.get("checked") and not item.get("active"):
+            _add_issue(
+                issues,
+                now=now,
+                level="error" if key != "dashboard" else "warn",
+                rule="service_inactive",
+                title=f"{spec['label']}未处于运行状态",
+                detail=f"{spec['service']} 当前状态为 {item.get('status') or '-'}。",
+                context={
+                    "serviceKey": key,
+                    "service": spec["service"],
+                    "status": item.get("status"),
+                },
+            )
+    return results
+
+
+def _issue_fingerprint(issue: dict[str, Any]) -> str:
+    stable = _json_safe_value(
+        {
+            "level": issue.get("level"),
+            "rule": issue.get("rule"),
+            "title": issue.get("title"),
+            "detail": issue.get("detail"),
+            "context": issue.get("context") or {},
+        }
+    )
     raw = json.dumps(stable, ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _today_key(now: float) -> str:
+    return dt.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+
+
+def _record_auto_repair_action(runtime_state: dict[str, Any], action: dict[str, Any]) -> None:
+    auto_repair = runtime_state.setdefault("autoRepair", {})
+    recent_actions = auto_repair.setdefault("recentActions", [])
+    recent_actions.append(action)
+    auto_repair["recentActions"] = recent_actions[-20:]
+
+
+def _service_auto_repair_state(runtime_state: dict[str, Any], service_key: str) -> dict[str, Any]:
+    auto_repair = runtime_state.setdefault("autoRepair", {})
+    services = auto_repair.setdefault("services", {})
+    state = services.get(service_key)
+    if not isinstance(state, dict):
+        state = {}
+    services[service_key] = state
+    return state
+
+
+def _attempt_service_restart(service_key: str) -> dict[str, Any]:
+    spec = MONITOR_SERVICE_SPECS[service_key]
+    service_name = spec["service"]
+    result = {
+        "serviceKey": service_key,
+        "service": service_name,
+        "label": spec["label"],
+        "attempted": False,
+        "ok": False,
+        "status": None,
+        "error": None,
+    }
+    systemctl = _systemctl_path()
+    if not systemctl:
+        result["error"] = "systemctl unavailable"
+        return result
+    try:
+        restart_proc = subprocess.run(
+            [systemctl, "restart", service_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        status_item = _service_status(service_name)
+        result["attempted"] = True
+        result["status"] = status_item.get("status")
+        result["ok"] = bool(status_item.get("active"))
+        stderr = (restart_proc.stderr or "").strip()
+        if restart_proc.returncode != 0 and not result["ok"]:
+            result["error"] = stderr or status_item.get("error") or f"restart exit code {restart_proc.returncode}"
+        elif not result["ok"]:
+            result["error"] = status_item.get("error") or "service not active after restart"
+    except Exception as exc:
+        result["attempted"] = True
+        result["error"] = str(exc)
+    return result
+
+
+def _apply_auto_repairs(
+    *,
+    issues: list[dict[str, Any]],
+    now: float,
+    runtime_state: dict[str, Any],
+    service_statuses: dict[str, Any],
+) -> dict[str, Any]:
+    enabled = _env_flag("MONITOR_ENABLE_AUTO_REPAIR", default=False)
+    cooldown_seconds = int(os.getenv("MONITOR_AUTO_REPAIR_COOLDOWN_SECONDS", "600"))
+    max_attempts_per_day = int(os.getenv("MONITOR_AUTO_REPAIR_MAX_ATTEMPTS_PER_SERVICE_PER_DAY", "6"))
+    summary = {
+        "enabled": enabled,
+        "cooldownSeconds": cooldown_seconds,
+        "maxAttemptsPerServicePerDay": max_attempts_per_day,
+        "actions": [],
+        "recentActions": list((runtime_state.get("autoRepair") or {}).get("recentActions") or [])[-10:],
+    }
+    if not enabled:
+        return summary
+
+    targets: dict[str, set[str]] = {}
+    for issue in issues:
+        rule = str(issue.get("rule") or "")
+        context = issue.get("context") or {}
+        for service_key, trigger_rules in AUTO_REPAIR_TRIGGER_RULES.items():
+            if rule in trigger_rules:
+                targets.setdefault(service_key, set()).add(rule)
+        if rule in {"runtime_artifact_missing", "runtime_artifact_stale"}:
+            artifact = str(context.get("artifact") or "")
+            for service_key, artifact_keys in AUTO_REPAIR_ARTIFACT_KEYS.items():
+                if artifact in artifact_keys:
+                    targets.setdefault(service_key, set()).add(f"{rule}:{artifact}")
+        if rule == "service_inactive":
+            service_key = str(context.get("serviceKey") or "")
+            if service_key in {"bot", "dashboard"}:
+                targets.setdefault(service_key, set()).add(rule)
+
+    today = _today_key(now)
+    for service_key in ("bot", "dashboard"):
+        trigger_rules = sorted(targets.get(service_key, set()))
+        if not trigger_rules:
+            continue
+        service_state = _service_auto_repair_state(runtime_state, service_key)
+        last_attempt_at = float(service_state.get("lastAttemptAt", 0) or 0)
+        daily_count_date = str(service_state.get("dailyCountDate") or "")
+        daily_count = int(service_state.get("dailyCount", 0) or 0)
+        if daily_count_date != today:
+            daily_count = 0
+        if last_attempt_at and now - last_attempt_at < cooldown_seconds:
+            continue
+        if daily_count >= max_attempts_per_day:
+            continue
+
+        action = {
+            "timestamp": now,
+            "serviceKey": service_key,
+            "service": MONITOR_SERVICE_SPECS[service_key]["service"],
+            "label": MONITOR_SERVICE_SPECS[service_key]["label"],
+            "triggerRules": trigger_rules,
+            "statusBefore": (service_statuses.get(service_key) or {}).get("status"),
+            "cooldownSeconds": cooldown_seconds,
+        }
+        repair_result = _attempt_service_restart(service_key)
+        action.update(repair_result)
+        summary["actions"].append(action)
+        _record_auto_repair_action(runtime_state, action)
+        service_state["lastAttemptAt"] = now
+        service_state["lastAttemptRules"] = trigger_rules
+        service_state["dailyCountDate"] = today
+        service_state["dailyCount"] = daily_count + 1
+        if repair_result.get("ok"):
+            service_state["lastSuccessAt"] = now
+            _add_issue(
+                issues,
+                now=now,
+                level="info",
+                rule="auto_repair_applied",
+                title=f"已自动重启{MONITOR_SERVICE_SPECS[service_key]['label']}",
+                detail=f"{MONITOR_SERVICE_SPECS[service_key]['service']} 因 {', '.join(trigger_rules)} 被自动重启。",
+                context={
+                    "serviceKey": service_key,
+                    "service": MONITOR_SERVICE_SPECS[service_key]["service"],
+                    "triggerRules": trigger_rules,
+                },
+            )
+            service_statuses[service_key] = _service_status(MONITOR_SERVICE_SPECS[service_key]["service"])
+        else:
+            _add_issue(
+                issues,
+                now=now,
+                level="warn",
+                rule="auto_repair_failed",
+                title=f"自动重启{MONITOR_SERVICE_SPECS[service_key]['label']}失败",
+                detail=repair_result.get("error") or "自动重启后服务仍未恢复。",
+                context={
+                    "serviceKey": service_key,
+                    "service": MONITOR_SERVICE_SPECS[service_key]["service"],
+                    "triggerRules": trigger_rules,
+                    "status": repair_result.get("status"),
+                },
+            )
+    summary["recentActions"] = list((runtime_state.get("autoRepair") or {}).get("recentActions") or [])[-10:]
+    return summary
 
 
 def _add_issue(
@@ -1193,9 +1547,19 @@ def _entry_audit_failures(audit: dict[str, Any]) -> list[str]:
             and funding_rate_pct > funding_threshold
         ):
             failures.append(f"资金费率 {funding_rate_pct}% 超过阈值 {funding_threshold}%")
-    if audit.get("correlationFilterEnabled") and audit.get("correlationPassed") is False:
-        correlated_symbol = audit.get("correlatedSymbol") or "-"
-        failures.append(f"与现有持仓 {correlated_symbol} 相关性过高")
+    if audit.get("correlationFilterEnabled"):
+        correlated_match_count = int(audit.get("correlatedMatchCount", 0) or 0)
+        correlation = _to_decimal(audit.get("correlation"))
+        correlation_threshold = _to_decimal(audit.get("correlationThreshold"))
+        correlation_hit = correlated_match_count > 0 or (
+            correlated_match_count == 0
+            and correlation is not None
+            and correlation_threshold is not None
+            and abs(correlation) >= correlation_threshold
+        )
+        if correlation_hit:
+            correlated_symbol = audit.get("correlatedSymbol") or "-"
+            failures.append(f"与现有持仓 {correlated_symbol} 相关性过高")
     if audit.get("stopLossEnabled") and not audit.get("stopLossConfigured"):
         failures.append("硬止损未配置成功")
     opened_before = int(audit.get("openedBefore", 0) or 0)
@@ -1337,9 +1701,24 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
         if not audit.get("stopLossEnabled"):
             failures.append("硬止损已关闭却仍然触发该平仓")
         stop_loss_pct = _to_decimal(audit.get("stopLossPct"))
+        stop_loss_mode = str(audit.get("stopLossMode") or "").lower()
+        breakeven_activated = audit.get("breakevenActivatedAt") not in (None, "")
+        exit_pnl_pct = _event_pnl_pct_for_price(event, _to_decimal(event.get("exitPrice")))
+        configured_stop_pnl_pct = _event_pnl_pct_for_price(
+            event, _to_decimal(audit.get("configuredStopLossPrice"))
+        )
+        breakeven_like_stop = _is_protective_breakeven_stop(event, audit)
         if stop_loss_pct is None:
             failures.append("未记录硬止损阈值")
-        elif current_pnl_pct is None or current_pnl_pct > -stop_loss_pct:
+        elif stop_loss_mode == "breakeven" or (
+            breakeven_activated and breakeven_like_stop
+        ):
+            if not breakeven_activated:
+                failures.append("保本止损平仓缺少保本激活时间记录")
+        elif not any(
+            value is not None and value <= -stop_loss_pct
+            for value in (current_pnl_pct, exit_pnl_pct, configured_stop_pnl_pct)
+        ):
             failures.append(
                 f"当前收益 {audit.get('currentPnlPct') or '-'} 未跌破止损阈值 -{audit.get('stopLossPct') or '-'}"
             )
@@ -1624,6 +2003,8 @@ def _render_monitor_report_markdown(summary: dict[str, Any]) -> str:
 
     bot_runtime = summary.get("botRuntime") or {}
     dashboard_health = summary.get("dashboardHealth") or {}
+    service_statuses = summary.get("serviceStatus") or {}
+    auto_repair = summary.get("autoRepair") or {}
     live_state = (summary.get("checks") or {}).get("liveState") or {}
     report_paths = summary.get("reportPaths") or {}
     trade_audits = summary.get("tradeAudits") or {}
@@ -1637,6 +2018,37 @@ def _render_monitor_report_markdown(summary: dict[str, Any]) -> str:
             f"- Bot 最近异常: {bot_runtime.get('lastFailureText') or '-'}",
             f"- Dashboard 健康检查: {'正常' if dashboard_health.get('ok') else '失败'}",
             f"- 交易所对账: {'正常' if live_state.get('ok') else ('未执行' if not live_state.get('checked') else '有差异')}",
+            "",
+            "## 服务状态",
+        ]
+    )
+    for key in ("bot", "dashboard", "monitor"):
+        item = service_statuses.get(key) or {}
+        lines.append(
+            f"- {item.get('label') or key}: {item.get('status') or '-'}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 自动自愈",
+            f"- 是否启用: {'是' if auto_repair.get('enabled') else '否'}",
+            f"- 冷却时间: {auto_repair.get('cooldownSeconds', '-')}",
+            f"- 每日上限: {auto_repair.get('maxAttemptsPerServicePerDay', '-')}",
+        ]
+    )
+    actions = auto_repair.get("actions") or []
+    if not actions:
+        lines.append("- 本轮没有执行自动重启。")
+    else:
+        for action in actions:
+            lines.append(
+                f"- {_fmt_ts(action.get('timestamp')) or '-'} | {action.get('service') or '-'} | "
+                f"{'成功' if action.get('ok') else '失败'} | 触发: {', '.join(action.get('triggerRules') or []) or '-'}"
+            )
+
+    lines.extend(
+        [
             "",
             "## 报告文件",
             f"- JSON 报告: {report_paths.get('json') or '-'}",
@@ -1689,7 +2101,7 @@ def _render_monitor_report_markdown(summary: dict[str, Any]) -> str:
 def _write_monitor_reports(workdir: Path, summary: dict[str, Any]) -> None:
     paths = _monitor_paths(workdir)
     _write_json(paths["report_json"], summary)
-    paths["report_md"].write_text(_render_monitor_report_markdown(summary), encoding="utf-8")
+    _write_text_atomic(paths["report_md"], _render_monitor_report_markdown(summary))
 
 
 def _write_monitor_failure_snapshot(workdir: Path, exc: Exception) -> None:
@@ -1723,6 +2135,14 @@ def _write_monitor_failure_snapshot(workdir: Path, exc: Exception) -> None:
             "logPath": paths["log"].as_posix(),
         },
         "dashboardHealth": {},
+        "serviceStatus": {},
+        "autoRepair": {
+            "enabled": _env_flag("MONITOR_ENABLE_AUTO_REPAIR", default=False),
+            "cooldownSeconds": int(os.getenv("MONITOR_AUTO_REPAIR_COOLDOWN_SECONDS", "600")),
+            "maxAttemptsPerServicePerDay": int(os.getenv("MONITOR_AUTO_REPAIR_MAX_ATTEMPTS_PER_SERVICE_PER_DAY", "6")),
+            "actions": [],
+            "recentActions": [],
+        },
         "runtimeArtifacts": {},
         "checks": {"liveState": {"checked": False, "ok": None}, "strategiesPresent": []},
         "positionCounts": {"total": 0, "long": 0, "short": 0},
@@ -1749,6 +2169,8 @@ def _build_monitor_summary(
     bot_runtime: dict[str, Any],
     monitor_runtime: dict[str, Any],
     dashboard_health: dict[str, Any],
+    service_statuses: dict[str, Any],
+    auto_repair: dict[str, Any],
     runtime_artifacts: dict[str, Any],
     recent_log_errors: list[dict[str, Any]],
     recent_incidents: list[dict[str, Any]],
@@ -1777,6 +2199,8 @@ def _build_monitor_summary(
         "botRuntime": bot_runtime,
         "monitorRuntime": monitor_runtime,
         "dashboardHealth": dashboard_health,
+        "serviceStatus": service_statuses,
+        "autoRepair": auto_repair,
         "runtimeArtifacts": runtime_artifacts,
         "tradeAudits": trade_audits,
         "checks": {
@@ -1808,6 +2232,10 @@ def run_monitor_once(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]
     issues: list[dict[str, Any]] = []
     monitor_interval_seconds = int(os.getenv("MONITOR_INTERVAL_SECONDS", "60"))
 
+    service_statuses = _inspect_services(
+        issues=issues,
+        now=now,
+    )
     _check_strategy_statuses(
         issues=issues,
         now=now,
@@ -1894,6 +2322,12 @@ def run_monitor_once(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]
         "exitExecution": exit_execution_audit,
         "pendingExit": pending_exit_audit,
     }
+    auto_repair = _apply_auto_repairs(
+        issues=issues,
+        now=now,
+        runtime_state=runtime_state,
+        service_statuses=service_statuses,
+    )
 
     severity_order = {"error": 0, "warn": 1, "info": 2}
     issues.sort(key=lambda item: (severity_order.get(item.get("level"), 9), item.get("rule", "")))
@@ -1908,6 +2342,8 @@ def run_monitor_once(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]
         bot_runtime=bot_runtime,
         monitor_runtime=monitor_runtime,
         dashboard_health=dashboard_health,
+        service_statuses=service_statuses,
+        auto_repair=auto_repair,
         runtime_artifacts=runtime_artifacts,
         recent_log_errors=recent_log_errors,
         recent_incidents=recent_incidents,

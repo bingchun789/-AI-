@@ -15,7 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from fetch_binance_ai_select import fetch_dataset, fetch_rendered_signal_lists
+from fetch_binance_ai_select import fetch_rendered_signal_lists
 from strategy_registry import (
     STRATEGY_CONFIG_FILE,
     STRATEGY_STATUS_FILE,
@@ -115,6 +115,12 @@ class BotConfig:
     max_short_open_positions: int
     enable_min_signal_count_filter: bool
     min_signal_count_to_open: int
+    enable_signal_count_entry_gate: bool
+    min_long_signal_count_to_open: int
+    min_short_signal_count_to_open: int
+    enable_signal_imbalance_filter: bool
+    signal_imbalance_min_count: int
+    signal_imbalance_ratio: float
     cooldown_minutes: int
     required_margin_mode: str
     skip_if_margin_mode_unavailable: bool
@@ -150,6 +156,20 @@ class BotConfig:
     signal_drop_guard_ratio: float
     signal_drop_guard_min_candidates: int
     signal_lost_exit_confirm_rounds: int
+    enable_signal_count_exit: bool
+    long_signal_count_to_close_below: int
+    short_signal_count_to_close_below: int
+    enable_post_entry_weak_exit: bool
+    long_weak_exit_start_minutes: int
+    long_weak_exit_end_minutes: int
+    long_weak_exit_min_peak_pnl_pct: float
+    long_weak_exit_signal_drop_count: int
+    long_weak_exit_rank_drop: int
+    short_weak_exit_start_minutes: int
+    short_weak_exit_end_minutes: int
+    short_weak_exit_min_peak_pnl_pct: float
+    short_weak_exit_signal_drop_count: int
+    short_weak_exit_opposite_rebound_count: int
     estimated_taker_fee_rate: float
     enable_account_circuit_breaker: bool
     daily_loss_pause_pct: float
@@ -189,34 +209,53 @@ class StateStore:
         return json.loads(self.path.read_text(encoding="utf-8-sig"))
 
     def save(self, state: dict[str, Any]) -> None:
-        self.path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        write_json_atomic(self.path, state)
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{time.time_ns()}.tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
 
 
 class BinanceFuturesCatalog:
     def __init__(self, exchange_info_url: str) -> None:
         self.exchange_info_url = exchange_info_url
         self._symbols_by_base_asset: dict[str, dict[str, Any]] | None = None
+        self._all_perpetuals_by_base_asset: dict[str, dict[str, Any]] | None = None
 
     def refresh(self) -> None:
         payload = http_get_json(self.exchange_info_url)
         symbols = {}
+        all_perpetuals = {}
         for item in payload.get("symbols", []):
-            if item.get("status") != "TRADING":
-                continue
             if item.get("contractType") != "PERPETUAL":
                 continue
             if item.get("quoteAsset") != "USDT":
                 continue
-            symbols[item["baseAsset"]] = item
+            base_asset = item["baseAsset"]
+            all_perpetuals[base_asset] = item
+            if item.get("status") != "TRADING":
+                continue
+            symbols[base_asset] = item
         self._symbols_by_base_asset = symbols
+        self._all_perpetuals_by_base_asset = all_perpetuals
 
     def get_contract(self, base_asset: str) -> dict[str, Any] | None:
         if self._symbols_by_base_asset is None:
             self.refresh()
         assert self._symbols_by_base_asset is not None
         return self._symbols_by_base_asset.get(base_asset)
+
+    def get_contract_entry(self, base_asset: str) -> dict[str, Any] | None:
+        if self._all_perpetuals_by_base_asset is None:
+            self.refresh()
+        assert self._all_perpetuals_by_base_asset is not None
+        return self._all_perpetuals_by_base_asset.get(base_asset)
 
 
 def position_key(asset: str, side: str) -> str:
@@ -248,6 +287,14 @@ def side_from_position(position: dict[str, Any]) -> str:
     if side in {LONG, SHORT}:
         return side
     return LONG
+
+
+def entry_trade_side_for_position(side: str) -> str:
+    return "BUY" if side == LONG else "SELL"
+
+
+def close_trade_side_for_position(side: str) -> str:
+    return "SELL" if side == LONG else "BUY"
 
 
 def live_side_from_amount(position_amt_raw: str | Decimal | int | float) -> str | None:
@@ -1486,7 +1533,18 @@ def select_broker_adapter() -> BrokerAdapter:
 def get_score(item: dict[str, Any]) -> float:
     metrics = item.get("metrics", {})
     score = metrics.get("sentiment_score", {}).get("value", "0")
-    return float(score)
+    try:
+        return float(score)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_display_score(item: dict[str, Any]) -> str | None:
+    metrics = item.get("metrics", {})
+    score = metrics.get("sentiment_score", {}).get("value")
+    if score in (None, ""):
+        return None
+    return str(score)
 
 
 def get_score_label(item: dict[str, Any]) -> str:
@@ -1511,33 +1569,245 @@ def is_strong_negative(item: dict[str, Any], threshold: float) -> bool:
     return get_score(item) <= threshold
 
 
-def fetch_signal_assets(
-    config: BotConfig,
+def sort_signal_candidates(
+    positive: list[dict[str, Any]],
+    negative: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return (strong_positive, strong_negative) candidate lists."""
-    try:
-        rendered_payload = fetch_rendered_signal_lists(config.interval)
-        if rendered_payload.get("ok"):
-            data = rendered_payload.get("json", {}).get("data", {})
-            positive = data.get("positiveItems", []) or []
-            negative = data.get("negativeItems", []) or []
-            if positive or negative:
-                positive.sort(key=lambda item: (item.get("rank") or 999999, -get_score(item)))
-                negative.sort(key=lambda item: (-(item.get("rank") or 0), get_score(item)))
-                return positive, negative
-    except Exception as exc:
-        logging.warning("rendered_signal_fetch_failed: %s", exc)
-
-    payload = fetch_dataset("assets", config.interval)
-    if not payload.get("ok"):
-        raise RuntimeError(f"AI Select request failed: {payload.get('status')}")
-
-    items = payload.get("json", {}).get("data", {}).get("items", [])
-    positive = [item for item in items if is_strong_positive(item, config.score_threshold)]
-    negative = [item for item in items if is_strong_negative(item, config.negative_score_threshold)]
     positive.sort(key=lambda item: (item.get("rank") or 999999, -get_score(item)))
     negative.sort(key=lambda item: (-(item.get("rank") or 0), get_score(item)))
     return positive, negative
+
+
+def build_signal_candidates_from_assets_payload(
+    payload: dict[str, Any],
+    config: "BotConfig",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not payload.get("ok"):
+        raise RuntimeError(f"AI Select request failed: {payload.get('status')}")
+    items = payload.get("json", {}).get("data", {}).get("items", [])
+    positive = [item for item in items if is_strong_positive(item, config.score_threshold)]
+    negative = [item for item in items if is_strong_negative(item, config.negative_score_threshold)]
+    return sort_signal_candidates(positive, negative)
+
+
+def is_signal_count_suspicious(
+    *,
+    previous_count: int,
+    current_count: int,
+    min_candidates: int,
+) -> bool:
+    if previous_count <= 0:
+        return False
+    if current_count <= 0:
+        return True
+    if current_count >= previous_count:
+        return False
+    review_ratio_threshold = math.ceil(previous_count * Decimal("0.85"))
+    review_threshold = max(int(min_candidates or 0), int(review_ratio_threshold))
+    return current_count < review_threshold
+
+
+def find_rendered_signal_issues(
+    *,
+    rendered_positive: list[dict[str, Any]],
+    rendered_negative: list[dict[str, Any]],
+    previous_positive_snapshot: list[dict[str, Any]],
+    previous_negative_snapshot: list[dict[str, Any]],
+    config: "BotConfig",
+    source_item_count: int | None = None,
+) -> list[str]:
+    issues: list[str] = []
+    if not rendered_positive and not rendered_negative:
+        issues.append("source_empty")
+        return issues
+    positive_count = len(rendered_positive)
+    negative_count = len(rendered_negative)
+    previous_positive_count = len(previous_positive_snapshot)
+    previous_negative_count = len(previous_negative_snapshot)
+
+    if is_signal_count_suspicious(
+        previous_count=previous_positive_count,
+        current_count=positive_count,
+        min_candidates=config.signal_drop_guard_min_candidates,
+    ):
+        issues.append(
+            f"positive_drop:{positive_count}/{previous_positive_count}"
+        )
+    if is_signal_count_suspicious(
+        previous_count=previous_negative_count,
+        current_count=negative_count,
+        min_candidates=config.signal_drop_guard_min_candidates,
+    ):
+        issues.append(
+            f"negative_drop:{negative_count}/{previous_negative_count}"
+        )
+    return issues
+
+
+def fetch_signal_assets(
+    config: BotConfig,
+    *,
+    previous_positive_snapshot: list[dict[str, Any]] | None = None,
+    previous_negative_snapshot: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Return (strong_positive, strong_negative) candidate lists."""
+    previous_positive_snapshot = previous_positive_snapshot or []
+    previous_negative_snapshot = previous_negative_snapshot or []
+    rendered_positive: list[dict[str, Any]] = []
+    rendered_negative: list[dict[str, Any]] = []
+    rendered_issues: list[str] = []
+    rendered_fetch_errors: list[str] = []
+    source_item_count = 0
+
+    for attempt in range(1, 6):
+        try:
+            rendered_payload = fetch_rendered_signal_lists(config.interval)
+            if not rendered_payload.get("ok"):
+                rendered_fetch_errors = [f"rendered_table_http_{rendered_payload.get('status')}"]
+                if attempt < 5:
+                    time.sleep(2)
+                continue
+            data = rendered_payload.get("json", {}).get("data", {})
+            source_item_count = int(data.get("scannedRowCount") or 0)
+            rendered_positive = data.get("positiveItems", []) or []
+            rendered_negative = data.get("negativeItems", []) or []
+            rendered_positive, rendered_negative = sort_signal_candidates(
+                rendered_positive,
+                rendered_negative,
+            )
+            rendered_fetch_errors = []
+            rendered_issues = find_rendered_signal_issues(
+                rendered_positive=rendered_positive,
+                rendered_negative=rendered_negative,
+                previous_positive_snapshot=previous_positive_snapshot,
+                previous_negative_snapshot=previous_negative_snapshot,
+                config=config,
+                source_item_count=source_item_count,
+            )
+            if (rendered_positive or rendered_negative) and not rendered_issues:
+                return rendered_positive, rendered_negative, {
+                    "source": "rendered_table",
+                    "renderedIssues": [],
+                    "blockNewEntries": False,
+                    "freezeSignalDecisions": False,
+                }
+            if rendered_issues and attempt < 5:
+                logging.warning(
+                    "signal_assets_suspect_retry attempt=%s issues=%s source_items=%s rendered_positive=%s rendered_negative=%s",
+                    attempt,
+                    rendered_issues,
+                    source_item_count,
+                    len(rendered_positive),
+                    len(rendered_negative),
+                )
+                time.sleep(2)
+                continue
+            if rendered_issues:
+                logging.warning(
+                    "signal_assets_suspect issues=%s source_items=%s rendered_positive=%s rendered_negative=%s previous_positive=%s previous_negative=%s",
+                    rendered_issues,
+                    source_item_count,
+                    len(rendered_positive),
+                    len(rendered_negative),
+                    len(previous_positive_snapshot),
+                    len(previous_negative_snapshot),
+                )
+        except Exception as exc:
+            logging.warning("signal_assets_fetch_failed attempt=%s error=%s", attempt, exc)
+            rendered_fetch_errors = [f"rendered_table_fetch_failed:{type(exc).__name__}"]
+            if attempt < 5:
+                time.sleep(2)
+
+    if rendered_positive or rendered_negative:
+        return rendered_positive, rendered_negative, {
+            "source": "rendered_table_invalid",
+            "renderedIssues": rendered_issues or rendered_fetch_errors or ["rendered_table_invalid"],
+            "blockNewEntries": True,
+            "freezeSignalDecisions": True,
+        }
+    return [], [], {
+        "source": "rendered_table_unavailable",
+        "renderedIssues": rendered_issues or rendered_fetch_errors or ["rendered_table_unavailable"],
+        "blockNewEntries": True,
+        "freezeSignalDecisions": True,
+    }
+
+
+def is_signal_imbalance_blocked(
+    *,
+    config: BotConfig,
+    candidate_count: int,
+    opposite_candidate_count: int,
+) -> bool:
+    if not config.enable_signal_imbalance_filter:
+        return False
+    min_count = int(config.signal_imbalance_min_count or 0)
+    ratio = Decimal(str(config.signal_imbalance_ratio))
+    if min_count <= 0 or ratio <= Decimal("0"):
+        return False
+    if candidate_count < min_count or opposite_candidate_count < min_count:
+        return False
+    if candidate_count <= 0:
+        return False
+    return Decimal(opposite_candidate_count) >= Decimal(candidate_count) * ratio
+
+
+def signal_count_entry_threshold_for_side(config: BotConfig, side: str) -> int:
+    return (
+        int(config.min_long_signal_count_to_open)
+        if side == LONG
+        else int(config.min_short_signal_count_to_open)
+    )
+
+
+def signal_count_exit_threshold_for_side(config: BotConfig, side: str) -> int:
+    return (
+        int(config.long_signal_count_to_close_below)
+        if side == LONG
+        else int(config.short_signal_count_to_close_below)
+    )
+
+
+def int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(str(value)))
+    except Exception:
+        return None
+
+
+def normalize_minute_window(start_minutes: int, end_minutes: int) -> tuple[int, int]:
+    start = max(0, int(start_minutes or 0))
+    end = max(0, int(end_minutes or 0))
+    if start <= end:
+        return start, end
+    return end, start
+
+
+def extract_entry_signal_counts(
+    side: str,
+    entry_audit: dict[str, Any] | None,
+) -> tuple[int | None, int | None]:
+    if not isinstance(entry_audit, dict):
+        return None, None
+    same_side_count = int_or_none(entry_audit.get("candidateCount"))
+    opposite_count = int_or_none(entry_audit.get("oppositeCandidateCount"))
+    if side == LONG:
+        return same_side_count, opposite_count
+    return same_side_count, opposite_count
+
+
+def has_met_peak_profit_threshold(
+    peak_pnl_pct: Decimal | None,
+    threshold_pct: float,
+) -> bool:
+    if peak_pnl_pct is None:
+        return False
+    threshold = Decimal(str(threshold_pct))
+    if threshold <= Decimal("0"):
+        return peak_pnl_pct > Decimal("0")
+    return peak_pnl_pct >= threshold
 
 
 def is_in_cooldown(
@@ -1617,10 +1887,7 @@ def record_account_equity_snapshot(
                 }
             )
             existing = existing[-20000:]
-            equity_history_file.write_text(
-                json.dumps(existing, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            write_json_atomic(equity_history_file, existing)
     return existing
 
 
@@ -2469,6 +2736,7 @@ def build_entry_audit_record(
     state: dict[str, Any],
     side: str,
     candidate_count: int,
+    opposite_candidate_count: int,
     opened_before: int,
     side_positions_before: int,
     total_positions_before: int,
@@ -2488,11 +2756,27 @@ def build_entry_audit_record(
     side_limit = config.max_long_open_positions if side == LONG else config.max_short_open_positions
     estimated_entry_risk = sizing_result.get("estimatedRiskUsdt")
     side_open_risk = risk_summary["longRiskUsdt"] if side == LONG else risk_summary["shortRiskUsdt"]
+    signal_count_entry_threshold = signal_count_entry_threshold_for_side(config, side)
     return {
         "version": 1,
         "candidateCount": candidate_count,
+        "oppositeCandidateCount": opposite_candidate_count,
         "minSignalFilterEnabled": bool(config.enable_min_signal_count_filter),
         "minSignalThreshold": int(config.min_signal_count_to_open),
+        "signalCountEntryGateEnabled": bool(config.enable_signal_count_entry_gate),
+        "signalCountEntryThreshold": signal_count_entry_threshold,
+        "signalCountEntryPassed": (
+            not config.enable_signal_count_entry_gate
+            or candidate_count >= signal_count_entry_threshold
+        ),
+        "signalImbalanceFilterEnabled": bool(config.enable_signal_imbalance_filter),
+        "signalImbalanceMinCount": int(config.signal_imbalance_min_count),
+        "signalImbalanceRatio": format_decimal_value(config.signal_imbalance_ratio),
+        "signalImbalancePassed": not is_signal_imbalance_blocked(
+            config=config,
+            candidate_count=candidate_count,
+            opposite_candidate_count=opposite_candidate_count,
+        ),
         "cooldownMinutes": int(config.cooldown_minutes),
         "cooldownPassed": True,
         "marginModeCheckEnabled": bool(config.skip_if_margin_mode_unavailable),
@@ -2519,7 +2803,11 @@ def build_entry_audit_record(
         "trendClose": format_decimal_value(trend_signal.get("close")) if trend_signal else None,
         "trendMa": format_decimal_value(trend_signal.get("ma")) if trend_signal else None,
         "correlationFilterEnabled": bool(config.enable_correlation_filter),
-        "correlationPassed": correlated_symbol is None,
+        "correlationPassed": (
+            True
+            if not config.enable_correlation_filter
+            else int(correlated_match_count or 0) == 0
+        ),
         "correlatedSymbol": correlated_symbol,
         "correlation": round(correlated_value, 4) if correlated_value is not None else None,
         "correlatedMatchCount": correlated_match_count,
@@ -2644,6 +2932,184 @@ def calculate_roundtrip_fee(
     return (entry_notional * fee_rate) + (exit_notional * fee_rate)
 
 
+def reconcile_missing_close_with_exchange(
+    *,
+    broker: BrokerAdapter,
+    position: dict[str, Any],
+    now_ms: int | None = None,
+) -> dict[str, Any] | None:
+    contract_symbol = str(position.get("contractSymbol") or "")
+    asset = str(position.get("asset") or contract_symbol.replace("USDT", ""))
+    side = side_from_position(position)
+    if not contract_symbol or side not in {LONG, SHORT}:
+        return None
+
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+
+    try:
+        opened_at_ms = int(float(position.get("openedAt") or time.time()) * 1000)
+    except Exception:
+        opened_at_ms = now_ms
+    start_time_ms = max(0, opened_at_ms - 60_000)
+
+    close_trade_side = close_trade_side_for_position(side)
+    entry_trade_side = entry_trade_side_for_position(side)
+
+    try:
+        trades = broker.get_user_trades(
+            symbol=contract_symbol,
+            start_time_ms=start_time_ms,
+            end_time_ms=now_ms,
+            limit=1000,
+        )
+    except Exception as exc:
+        logging.warning(
+            "missing_close_trade_lookup_failed symbol=%s side=%s error=%s",
+            contract_symbol,
+            side,
+            exc,
+        )
+        return None
+
+    close_groups: dict[str, dict[str, Any]] = {}
+    entry_groups: dict[str, dict[str, Any]] = {}
+    for trade in trades:
+        trade_time_ms = int(trade.get("time", 0) or 0)
+        if trade_time_ms < start_time_ms:
+            continue
+        trade_side = str(trade.get("side", "")).upper()
+        order_id = str(trade.get("orderId") or "")
+        if not order_id:
+            continue
+        qty = decimal_or_none(trade.get("qty")) or Decimal("0")
+        if qty <= Decimal("0"):
+            continue
+        price = decimal_or_none(trade.get("price")) or Decimal("0")
+        commission = abs(decimal_or_none(trade.get("commission")) or Decimal("0"))
+
+        if trade_side == close_trade_side:
+            grouped = close_groups.setdefault(
+                order_id,
+                {
+                    "orderId": order_id,
+                    "closedAtMs": trade_time_ms,
+                    "exitQty": Decimal("0"),
+                    "exitNotional": Decimal("0"),
+                    "realizedPnl": Decimal("0"),
+                    "commission": Decimal("0"),
+                },
+            )
+            grouped["closedAtMs"] = max(grouped["closedAtMs"], trade_time_ms)
+            grouped["exitQty"] += qty
+            grouped["exitNotional"] += price * qty
+            grouped["realizedPnl"] += decimal_or_none(trade.get("realizedPnl")) or Decimal("0")
+            grouped["commission"] += commission
+        elif trade_side == entry_trade_side:
+            grouped = entry_groups.setdefault(
+                order_id,
+                {
+                    "orderId": order_id,
+                    "firstTradeMs": trade_time_ms,
+                    "commission": Decimal("0"),
+                },
+            )
+            grouped["firstTradeMs"] = min(grouped["firstTradeMs"], trade_time_ms)
+            grouped["commission"] += commission
+
+    if not close_groups:
+        return None
+
+    latest_close = max(close_groups.values(), key=lambda row: row["closedAtMs"])
+    entry_group = (
+        min(entry_groups.values(), key=lambda row: row["firstTradeMs"])
+        if entry_groups
+        else None
+    )
+
+    latest_order = None
+    try:
+        for order in broker.get_all_orders(
+            symbol=contract_symbol,
+            start_time_ms=start_time_ms,
+            end_time_ms=now_ms,
+            limit=500,
+        ):
+            if str(order.get("orderId") or "") == latest_close["orderId"]:
+                latest_order = order
+                break
+    except Exception as exc:
+        logging.warning(
+            "missing_close_order_lookup_failed symbol=%s side=%s error=%s",
+            contract_symbol,
+            side,
+            exc,
+        )
+
+    force_row = None
+    force_start_ms = max(start_time_ms, latest_close["closedAtMs"] - 5 * 60 * 1000)
+    force_end_ms = min(now_ms, latest_close["closedAtMs"] + 5 * 60 * 1000)
+    if force_end_ms <= force_start_ms:
+        force_end_ms = force_start_ms + 1
+    try:
+        for row in broker.get_force_orders(
+            start_time_ms=force_start_ms,
+            end_time_ms=force_end_ms,
+            limit=100,
+        ):
+            if str(row.get("symbol") or "") != contract_symbol:
+                continue
+            if str(row.get("orderId") or "") != latest_close["orderId"]:
+                continue
+            force_row = row
+            break
+    except Exception as exc:
+        logging.warning(
+            "missing_close_force_order_lookup_failed symbol=%s side=%s error=%s",
+            contract_symbol,
+            side,
+            exc,
+        )
+
+    total_fee = latest_close["commission"]
+    if entry_group is not None:
+        total_fee += entry_group["commission"]
+
+    exit_price = format_decimal_value(position.get("entryPrice"))
+    if latest_close["exitQty"] != Decimal("0"):
+        exit_price = format(latest_close["exitNotional"] / latest_close["exitQty"], "f")
+
+    reason = "exchange_trade"
+    if force_row is not None:
+        auto_close_type = str(force_row.get("autoCloseType", "")).upper()
+        if auto_close_type == "LIQUIDATION":
+            reason = "liquidation"
+        elif auto_close_type == "ADL":
+            reason = "adl"
+        else:
+            reason = "force_order"
+    elif latest_order is not None and str(latest_order.get("closePosition")).lower() == "true":
+        reason = "stop_loss"
+
+    realized_pnl = latest_close["realizedPnl"]
+    net_realized = realized_pnl - total_fee
+    return {
+        "orderId": latest_close["orderId"],
+        "status": (latest_order.get("status") if latest_order else None) or "FILLED",
+        "contractSymbol": contract_symbol,
+        "asset": asset,
+        "exitPrice": exit_price,
+        "confirmedClosed": True,
+        "closedAtMs": latest_close["closedAtMs"],
+        "closeRetryCount": 0,
+        "exitQty": format_decimal_value(latest_close["exitQty"]),
+        "realizedPnlUsdt": format_decimal_value(realized_pnl),
+        "estimatedFeeUsdt": format_decimal_value(total_fee),
+        "netRealizedPnlUsdt": format_decimal_value(net_realized),
+        "reason": reason,
+    }
+
+
 def build_exit_record(
     *,
     asset: str,
@@ -2655,15 +3121,32 @@ def build_exit_record(
     fee_rate: Decimal,
     audit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    realized_pnl = calculate_realized_pnl(position, close_result.get("exitPrice"))
-    estimated_fee = calculate_roundtrip_fee(
-        entry_notional_raw=position.get("notionalUsdt"),
-        exit_price_raw=close_result.get("exitPrice"),
-        position=position,
-        fee_rate=fee_rate,
-    )
-    net_realized_pnl = None
-    if realized_pnl is not None:
+    realized_pnl = decimal_or_none(close_result.get("realizedPnlUsdt"))
+    if realized_pnl is None:
+        realized_pnl = calculate_realized_pnl(position, close_result.get("exitPrice"))
+
+    estimated_fee = decimal_or_none(close_result.get("estimatedFeeUsdt"))
+    if estimated_fee is None:
+        estimated_fee = calculate_roundtrip_fee(
+            entry_notional_raw=position.get("notionalUsdt"),
+            exit_price_raw=close_result.get("exitPrice"),
+            position=position,
+            fee_rate=fee_rate,
+        )
+
+    net_realized_pnl = decimal_or_none(close_result.get("netRealizedPnlUsdt"))
+    if net_realized_pnl is None and realized_pnl is not None:
+        net_realized_pnl = realized_pnl - (estimated_fee or Decimal("0"))
+
+    event_timestamp = time.time()
+    closed_at_ms = close_result.get("closedAtMs")
+    if closed_at_ms not in (None, ""):
+        try:
+            event_timestamp = int(closed_at_ms) / 1000
+        except Exception:
+            event_timestamp = time.time()
+
+    if realized_pnl is not None and net_realized_pnl is None:
         net_realized_pnl = realized_pnl - (estimated_fee or Decimal("0"))
 
     close_side = "unknown"
@@ -2673,7 +3156,7 @@ def build_exit_record(
             close_side = "flat"
 
     return {
-        "timestamp": time.time(),
+        "timestamp": event_timestamp,
         "closedAtMs": close_result.get("closedAtMs"),
         "confirmedClosed": close_result.get("confirmedClosed"),
         "closeRetryCount": close_result.get("closeRetryCount", 0),
@@ -2755,14 +3238,17 @@ def build_partial_exit_record(
     return event
 
 
-def write_snapshot(path: Path, candidates: list[dict[str, Any]]) -> None:
-    snapshot = [
+def build_signal_rows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
         {
             "rank": item.get("rank"),
+            "sourceRank": item.get("sourceRank"),
             "asset": normalize_asset(item.get("asset", ""), item.get("baseAsset")),
             "rawAsset": item.get("asset"),
+            "displayAsset": item.get("displayAsset"),
             "assetType": item.get("assetType"),
-            "score": get_score(item),
+            "tokenId": item.get("tokenId"),
+            "score": get_display_score(item),
             "scoreLabel": item.get("metrics", {})
             .get("sentiment_score", {})
             .get("valueLabel"),
@@ -2778,7 +3264,11 @@ def write_snapshot(path: Path, candidates: list[dict[str, Any]]) -> None:
         }
         for item in candidates
     ]
-    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_snapshot(path: Path, candidates: list[dict[str, Any]]) -> None:
+    snapshot = build_signal_rows(candidates)
+    write_json_atomic(path, snapshot)
 
 
 def load_snapshot_rows(path: Path) -> list[dict[str, Any]]:
@@ -2832,11 +3322,13 @@ def should_preserve_previous_snapshot(
     current_position_count: int,
     suspend_signal_lost_exit: bool,
 ) -> bool:
+    if suspend_signal_lost_exit:
+        return bool(previous_snapshot)
     if current_position_count <= 0:
         return False
     if not current_candidates and previous_snapshot:
         return True
-    return suspend_signal_lost_exit
+    return False
 
 
 def count_open_positions_for_side(state: dict[str, Any], side: str) -> int:
@@ -2953,6 +3445,174 @@ def build_close_failed_decision(
     }
 
 
+def evaluate_post_entry_weak_exit(
+    *,
+    config: BotConfig,
+    side: str,
+    position: dict[str, Any],
+    tracking: dict[str, Decimal | None],
+    candidate_count: int,
+    opposite_candidate_count: int,
+    current_rank: int | None,
+    previous_snapshot_assets: set[str],
+    block_new_entries: bool,
+    suspend_signal_lost_exit: bool,
+) -> dict[str, Any] | None:
+    if not config.enable_post_entry_weak_exit:
+        return None
+    if block_new_entries or suspend_signal_lost_exit:
+        return None
+    age_hours = position_age_hours(position)
+    if age_hours is None:
+        return None
+    age_minutes = age_hours * 60
+    peak_pnl_pct = tracking.get("peak")
+    if peak_pnl_pct is None:
+        peak_pnl_pct = decimal_or_none(position.get("maxProfitPct"))
+
+    entry_same_side_count, entry_opposite_count = extract_entry_signal_counts(
+        side,
+        position.get("entryAudit"),
+    )
+    entry_rank = int_or_none(position.get("rank"))
+
+    if side == LONG:
+        start_minutes, end_minutes = normalize_minute_window(
+            config.long_weak_exit_start_minutes,
+            config.long_weak_exit_end_minutes,
+        )
+        if age_minutes < start_minutes or age_minutes > end_minutes:
+            return None
+        if has_met_peak_profit_threshold(
+            peak_pnl_pct,
+            config.long_weak_exit_min_peak_pnl_pct,
+        ):
+            return None
+
+        signal_drop_count = None
+        signal_drop_triggered = False
+        if entry_same_side_count is not None:
+            signal_drop_count = entry_same_side_count - int(candidate_count or 0)
+            signal_drop_triggered = (
+                signal_drop_count >= int(config.long_weak_exit_signal_drop_count or 0)
+            )
+
+        rank_drop = None
+        rank_drop_triggered = False
+        rank_missing_triggered = False
+        if entry_rank is not None:
+            if current_rank is None:
+                if position.get("asset") not in previous_snapshot_assets:
+                    rank_missing_triggered = True
+                    rank_drop_triggered = True
+            else:
+                rank_drop = current_rank - entry_rank
+                rank_drop_triggered = (
+                    rank_drop >= int(config.long_weak_exit_rank_drop or 0)
+                )
+
+        if not signal_drop_triggered and not rank_drop_triggered:
+            return None
+
+        trigger_modes: list[str] = []
+        if signal_drop_triggered:
+            trigger_modes.append("strong_long_count_drop")
+        if rank_missing_triggered:
+            trigger_modes.append("dropped_out_of_strong_long_list")
+        elif rank_drop_triggered:
+            trigger_modes.append("rank_drop")
+
+        parts = [
+            f"开仓后 {age_minutes:.0f} 分钟",
+            f"历史最高收益 {format_decimal_value(peak_pnl_pct)}%",
+        ]
+        if signal_drop_count is not None:
+            parts.append(
+                f"强烈看多个数从 {entry_same_side_count} 降到 {candidate_count}"
+            )
+        if rank_missing_triggered:
+            parts.append("当前已掉出强烈看多列表")
+        elif entry_rank is not None and current_rank is not None:
+            parts.append(f"排名从 {entry_rank} 后移到 {current_rank}")
+        return {
+            "reason": "post_entry_weakness_exit",
+            "detail": "，".join(parts),
+            "ageMinutes": round(age_minutes, 2),
+            "peakPnlPct": format_decimal_value(peak_pnl_pct),
+            "entrySignalCount": entry_same_side_count,
+            "currentSignalCount": candidate_count,
+            "signalDropCount": signal_drop_count,
+            "entryRank": entry_rank,
+            "currentRank": current_rank,
+            "rankDrop": rank_drop,
+            "triggerModes": trigger_modes,
+        }
+
+    start_minutes, end_minutes = normalize_minute_window(
+        config.short_weak_exit_start_minutes,
+        config.short_weak_exit_end_minutes,
+    )
+    if age_minutes < start_minutes or age_minutes > end_minutes:
+        return None
+    if has_met_peak_profit_threshold(
+        peak_pnl_pct,
+        config.short_weak_exit_min_peak_pnl_pct,
+    ):
+        return None
+
+    signal_drop_count = None
+    signal_drop_triggered = False
+    if entry_same_side_count is not None:
+        signal_drop_count = entry_same_side_count - int(candidate_count or 0)
+        signal_drop_triggered = (
+            signal_drop_count >= int(config.short_weak_exit_signal_drop_count or 0)
+        )
+
+    opposite_rebound_count = None
+    opposite_rebound_triggered = False
+    if entry_opposite_count is not None:
+        opposite_rebound_count = int(opposite_candidate_count or 0) - entry_opposite_count
+        opposite_rebound_triggered = (
+            opposite_rebound_count
+            >= int(config.short_weak_exit_opposite_rebound_count or 0)
+        )
+
+    if not signal_drop_triggered and not opposite_rebound_triggered:
+        return None
+
+    trigger_modes = []
+    if signal_drop_triggered:
+        trigger_modes.append("strong_short_count_drop")
+    if opposite_rebound_triggered:
+        trigger_modes.append("strong_long_rebound")
+
+    parts = [
+        f"开仓后 {age_minutes:.0f} 分钟",
+        f"历史最高收益 {format_decimal_value(peak_pnl_pct)}%",
+    ]
+    if signal_drop_count is not None:
+        parts.append(
+            f"强烈看空个数从 {entry_same_side_count} 降到 {candidate_count}"
+        )
+    if opposite_rebound_count is not None:
+        parts.append(
+            f"强烈看多个数从 {entry_opposite_count} 升到 {opposite_candidate_count}"
+        )
+    return {
+        "reason": "post_entry_weakness_exit",
+        "detail": "，".join(parts),
+        "ageMinutes": round(age_minutes, 2),
+        "peakPnlPct": format_decimal_value(peak_pnl_pct),
+        "entrySignalCount": entry_same_side_count,
+        "currentSignalCount": candidate_count,
+        "signalDropCount": signal_drop_count,
+        "entryOppositeSignalCount": entry_opposite_count,
+        "currentOppositeSignalCount": opposite_candidate_count,
+        "oppositeReboundCount": opposite_rebound_count,
+        "triggerModes": trigger_modes,
+    }
+
+
 def process_strategy(
     *,
     config: BotConfig,
@@ -2962,10 +3622,16 @@ def process_strategy(
     strategy_id: str,
     side: str,
     candidates: list[dict[str, Any]],
+    opposite_candidate_count: int = 0,
     suspend_signal_lost_exit: bool = False,
     previous_snapshot: list[dict[str, Any]] | None = None,
     account_snapshot: dict[str, Any] | None = None,
     circuit_breaker: dict[str, Any] | None = None,
+    block_new_entries: bool = False,
+    block_new_entries_reason: str | None = None,
+    freeze_signal_decisions: bool = False,
+    signal_source: str | None = None,
+    signal_fetch_issues: list[str] | None = None,
 ) -> dict[str, Any]:
     strategy_config = get_strategy_config(config.strategy_config_file, strategy_id)
     if not strategy_config.get("enabled", True):
@@ -2980,6 +3646,7 @@ def process_strategy(
                 "status": "disabled",
                 "side": side,
                 "candidateCount": 0,
+                "oppositeCandidateCount": 0,
                 "openedCount": 0,
                 "closedCount": 0,
                 "closedWinCount": 0,
@@ -2987,12 +3654,19 @@ def process_strategy(
                 "closedFlatCount": 0,
                 "realizedPnlUsdt": "0",
                 "latestDecisions": [],
+                "currentCandidateItems": [],
+                "signalDropGuardActive": False,
+                "blockNewEntriesActive": False,
+                "blockNewEntriesReason": None,
+                "signalSource": signal_source,
+                "signalFetchIssues": signal_fetch_issues or [],
             },
         )
         return {
             "strategyId": strategy_id,
             "side": side,
             "candidateCount": 0,
+            "oppositeCandidateCount": 0,
             "openedCount": 0,
             "closedCount": 0,
             "decisions": [],
@@ -3001,8 +3675,16 @@ def process_strategy(
 
     fee_rate = Decimal(str(config.estimated_taker_fee_rate))
     candidate_count = len(candidates)
+    entry_signal_count_threshold = signal_count_entry_threshold_for_side(config, side)
+    exit_signal_count_threshold = signal_count_exit_threshold_for_side(config, side)
     candidate_assets = {
         normalize_asset(item.get("asset", ""), item.get("baseAsset")) for item in candidates
+    }
+    candidate_rank_map = {
+        normalize_asset(item.get("asset", ""), item.get("baseAsset")): int_or_none(
+            item.get("rank")
+        )
+        for item in candidates
     }
     previous_snapshot_assets = {
         row.get("asset") for row in (previous_snapshot or []) if row.get("asset")
@@ -3025,14 +3707,33 @@ def process_strategy(
         live_position = broker.get_live_position(position["contractSymbol"], side)
         if live_position is not None:
             continue
-        close_result = {
-            "status": "POSITION_MISSING",
-            "exitPrice": format(broker.get_mark_price(position["contractSymbol"]), "f"),
-        }
+        now_ms = int(time.time() * 1000)
+        close_result = reconcile_missing_close_with_exchange(
+            broker=broker,
+            position=position,
+            now_ms=now_ms,
+        )
+        if close_result is None:
+            close_result = {
+                "status": "POSITION_MISSING",
+                "exitPrice": format(broker.get_mark_price(position["contractSymbol"]), "f"),
+                "confirmedClosed": False,
+                "closedAtMs": None,
+                "reason": "exchange_position_missing",
+            }
+        resolved_reason = str(close_result.get("reason") or "exchange_position_missing")
+        if resolved_reason != "exchange_position_missing":
+            logging.info(
+                "missing_position_reconciled symbol=%s side=%s reason=%s orderId=%s",
+                position["contractSymbol"],
+                side,
+                resolved_reason,
+                close_result.get("orderId"),
+            )
         exit_audit = build_exit_audit_record(
             config=config,
             position=position,
-            reason="exchange_position_missing",
+            reason=resolved_reason,
         )
         exit_event = build_exit_record(
             asset=position["asset"],
@@ -3040,7 +3741,7 @@ def process_strategy(
             strategy_id=strategy_id,
             position=position,
             close_result=close_result,
-            reason="exchange_position_missing",
+            reason=resolved_reason,
             fee_rate=fee_rate,
             audit=exit_audit,
         )
@@ -3053,7 +3754,7 @@ def process_strategy(
                 "action": exit_action(side),
                 "contractSymbol": position["contractSymbol"],
                 "status": close_result["status"],
-                "reason": "exchange_position_missing",
+                "reason": resolved_reason,
                 "realizedPnlUsdt": exit_event["realizedPnlUsdt"],
                 "netRealizedPnlUsdt": exit_event["netRealizedPnlUsdt"],
                 "closeSide": exit_event["closeSide"],
@@ -3514,6 +4215,170 @@ def process_strategy(
             )
             closed += 1
             continue
+        if freeze_signal_decisions:
+            position["signalLostRounds"] = 0
+            decisions.append(
+                {
+                    "asset": position["asset"],
+                    "side": side,
+                    "action": "hold",
+                    "reason": "signal_source_unstable",
+                    "signalSource": signal_source,
+                    "signalFetchIssues": signal_fetch_issues or [],
+                }
+            )
+            continue
+        weak_exit_context = evaluate_post_entry_weak_exit(
+            config=config,
+            side=side,
+            position=position,
+            tracking=tracking,
+            candidate_count=candidate_count,
+            opposite_candidate_count=opposite_candidate_count,
+            current_rank=candidate_rank_map.get(position["asset"]),
+            previous_snapshot_assets=previous_snapshot_assets,
+            block_new_entries=block_new_entries,
+            suspend_signal_lost_exit=suspend_signal_lost_exit,
+        )
+        if weak_exit_context is not None:
+            exit_audit = build_exit_audit_record(
+                config=config,
+                position=position,
+                reason="post_entry_weakness_exit",
+                tracking=tracking,
+            )
+            exit_audit.update(
+                {
+                    "ageMinutes": weak_exit_context.get("ageMinutes"),
+                    "peakPnlPct": weak_exit_context.get("peakPnlPct"),
+                    "entrySignalCount": weak_exit_context.get("entrySignalCount"),
+                    "currentSignalCount": weak_exit_context.get("currentSignalCount"),
+                    "signalDropCount": weak_exit_context.get("signalDropCount"),
+                    "entryOppositeSignalCount": weak_exit_context.get(
+                        "entryOppositeSignalCount"
+                    ),
+                    "currentOppositeSignalCount": weak_exit_context.get(
+                        "currentOppositeSignalCount"
+                    ),
+                    "oppositeReboundCount": weak_exit_context.get(
+                        "oppositeReboundCount"
+                    ),
+                    "entryRank": weak_exit_context.get("entryRank"),
+                    "currentRank": weak_exit_context.get("currentRank"),
+                    "rankDrop": weak_exit_context.get("rankDrop"),
+                    "triggerModes": weak_exit_context.get("triggerModes") or [],
+                }
+            )
+            close_result = broker.close_position(
+                contract_symbol=position["contractSymbol"],
+                asset=position["asset"],
+                side=side,
+                position=position,
+                dry_run=config.dry_run,
+            )
+            if not is_close_result_success(close_result):
+                decisions.append(
+                    build_close_failed_decision(
+                        position=position,
+                        side=side,
+                        attempted_reason="post_entry_weakness_exit",
+                        close_result=close_result,
+                    )
+                )
+                continue
+            exit_event = build_exit_record(
+                asset=position["asset"],
+                side=side,
+                strategy_id=strategy_id,
+                position=position,
+                close_result=close_result,
+                reason="post_entry_weakness_exit",
+                fee_rate=fee_rate,
+                audit=exit_audit,
+            )
+            state.setdefault("history", []).append(exit_event)
+            state.get("positions", {}).pop(key, None)
+            decisions.append(
+                {
+                    "asset": position["asset"],
+                    "side": side,
+                    "action": exit_action(side),
+                    "contractSymbol": position["contractSymbol"],
+                    "status": close_result["status"],
+                    "reason": "post_entry_weakness_exit",
+                    "detail": weak_exit_context.get("detail"),
+                    "ageMinutes": weak_exit_context.get("ageMinutes"),
+                    "peakPnlPct": weak_exit_context.get("peakPnlPct"),
+                    "triggerModes": weak_exit_context.get("triggerModes") or [],
+                    "realizedPnlUsdt": exit_event["realizedPnlUsdt"],
+                    "netRealizedPnlUsdt": exit_event["netRealizedPnlUsdt"],
+                    "closeSide": exit_event["closeSide"],
+                }
+            )
+            closed += 1
+            continue
+        if (
+            config.enable_signal_count_exit
+            and candidate_count < exit_signal_count_threshold
+        ):
+            exit_audit = build_exit_audit_record(
+                config=config,
+                position=position,
+                reason="signal_count_below_exit_threshold",
+                tracking=tracking,
+            )
+            exit_audit["currentSignalCount"] = candidate_count
+            exit_audit["exitSignalCountThreshold"] = exit_signal_count_threshold
+            close_result = broker.close_position(
+                contract_symbol=position["contractSymbol"],
+                asset=position["asset"],
+                side=side,
+                position=position,
+                dry_run=config.dry_run,
+            )
+            if not is_close_result_success(close_result):
+                decisions.append(
+                    build_close_failed_decision(
+                        position=position,
+                        side=side,
+                        attempted_reason="signal_count_below_exit_threshold",
+                        close_result=close_result,
+                    )
+                )
+                continue
+            exit_event = build_exit_record(
+                asset=position["asset"],
+                side=side,
+                strategy_id=strategy_id,
+                position=position,
+                close_result=close_result,
+                reason="signal_count_below_exit_threshold",
+                fee_rate=fee_rate,
+                audit=exit_audit,
+            )
+            state.setdefault("history", []).append(exit_event)
+            state.get("positions", {}).pop(key, None)
+            decisions.append(
+                {
+                    "asset": position["asset"],
+                    "side": side,
+                    "action": exit_action(side),
+                    "contractSymbol": position["contractSymbol"],
+                    "status": close_result["status"],
+                    "reason": "signal_count_below_exit_threshold",
+                    "detail": (
+                        f"当前强信号 {candidate_count} 个，低于平仓阈值 "
+                        f"{exit_signal_count_threshold} 个"
+                    ),
+                    "currentSignalCount": candidate_count,
+                    "exitSignalCountThreshold": exit_signal_count_threshold,
+                    "realizedPnlUsdt": exit_event["realizedPnlUsdt"],
+                    "netRealizedPnlUsdt": exit_event["netRealizedPnlUsdt"],
+                    "closeSide": exit_event["closeSide"],
+                }
+            )
+            closed += 1
+            continue
 
         if position["asset"] in candidate_assets:
             position["signalLostRounds"] = 0
@@ -3620,11 +4485,38 @@ def process_strategy(
 
     for item in candidates:
         asset = normalize_asset(item.get("asset", ""), item.get("baseAsset"))
+        if block_new_entries:
+            decisions.append(
+                {
+                    "asset": asset,
+                    "side": side,
+                    "action": "skip",
+                    "reason": block_new_entries_reason or "signal_source_unstable",
+                    "currentSignalCount": candidate_count,
+                    "oppositeSignalCount": opposite_candidate_count,
+                    "signalSource": signal_source,
+                    "signalFetchIssues": signal_fetch_issues or [],
+                }
+            )
+            continue
         contract = futures_catalog.get_contract(asset)
         if not contract:
-            decisions.append(
-                {"asset": asset, "side": side, "action": "skip", "reason": "no_usdt_perpetual"}
-            )
+            contract_entry = futures_catalog.get_contract_entry(asset)
+            if contract_entry:
+                decisions.append(
+                    {
+                        "asset": asset,
+                        "side": side,
+                        "action": "skip",
+                        "reason": "contract_not_trading",
+                        "contractSymbol": contract_entry.get("symbol"),
+                        "contractStatus": contract_entry.get("status"),
+                    }
+                )
+            else:
+                decisions.append(
+                    {"asset": asset, "side": side, "action": "skip", "reason": "no_usdt_perpetual"}
+                )
             continue
 
         margin_usage_pct = None
@@ -3691,6 +4583,26 @@ def process_strategy(
             continue
 
         if (
+            config.enable_signal_count_entry_gate
+            and candidate_count < entry_signal_count_threshold
+        ):
+            decisions.append(
+                {
+                    "asset": asset,
+                    "side": side,
+                    "action": "skip",
+                    "reason": "signal_count_entry_gate_blocked",
+                    "detail": (
+                        f"当前强信号 {candidate_count} 个，榜单数量开仓至少需要 "
+                        f"{entry_signal_count_threshold} 个"
+                    ),
+                    "currentSignalCount": candidate_count,
+                    "requiredSignalCount": entry_signal_count_threshold,
+                }
+            )
+            continue
+
+        if (
             config.enable_min_signal_count_filter
             and candidate_count < config.min_signal_count_to_open
         ):
@@ -3702,6 +4614,25 @@ def process_strategy(
                     "reason": "signal_count_too_low",
                     "currentSignalCount": candidate_count,
                     "minSignalCountToOpen": config.min_signal_count_to_open,
+                }
+            )
+            continue
+
+        if is_signal_imbalance_blocked(
+            config=config,
+            candidate_count=candidate_count,
+            opposite_candidate_count=opposite_candidate_count,
+        ):
+            decisions.append(
+                {
+                    "asset": asset,
+                    "side": side,
+                    "action": "skip",
+                    "reason": "signal_imbalance_blocked",
+                    "currentSignalCount": candidate_count,
+                    "oppositeSignalCount": opposite_candidate_count,
+                    "signalImbalanceMinCount": config.signal_imbalance_min_count,
+                    "signalImbalanceRatio": format_decimal_value(config.signal_imbalance_ratio),
                 }
             )
             continue
@@ -3982,6 +4913,7 @@ def process_strategy(
             state=state,
             side=side,
             candidate_count=candidate_count,
+            opposite_candidate_count=opposite_candidate_count,
             opened_before=opened,
             side_positions_before=side_positions_before,
             total_positions_before=total_positions_before,
@@ -4001,6 +4933,7 @@ def process_strategy(
 
         metadata = {
             "rank": item.get("rank"),
+            "sourceRank": item.get("sourceRank"),
             "score": get_score(item),
             "scoreLabel": get_score_label(item),
             "signalSource": "binance_ai_select",
@@ -4058,6 +4991,7 @@ def process_strategy(
             "quantity": order_result.get("quantity"),
             "entryPrice": order_result.get("entryPrice"),
             "rank": item.get("rank"),
+            "sourceRank": item.get("sourceRank"),
             "score": get_score(item),
             "scoreLabel": get_score_label(item),
             "notionalUsdt": order_result.get("notionalUsdt", format_decimal_value(entry_notional)),
@@ -4179,6 +5113,7 @@ def process_strategy(
             "status": "guarded" if circuit_breaker and circuit_breaker.get("active") else "ok",
             "side": side,
             "candidateCount": len(candidates),
+            "oppositeCandidateCount": opposite_candidate_count,
             "openedCount": opened,
             "closedCount": closed,
             "closedWinCount": closed_win_count,
@@ -4187,6 +5122,12 @@ def process_strategy(
             "realizedPnlUsdt": str(realized_pnl_total),
             "accountCircuitBreaker": circuit_breaker or {},
             "latestDecisions": decisions,
+            "currentCandidateItems": build_signal_rows(candidates),
+            "signalDropGuardActive": suspend_signal_lost_exit,
+            "blockNewEntriesActive": block_new_entries,
+            "blockNewEntriesReason": block_new_entries_reason,
+            "signalSource": signal_source,
+            "signalFetchIssues": signal_fetch_issues or [],
         },
     )
 
@@ -4194,6 +5135,7 @@ def process_strategy(
         "strategyId": strategy_id,
         "side": side,
         "candidateCount": len(candidates),
+        "oppositeCandidateCount": opposite_candidate_count,
         "openedCount": opened,
         "closedCount": closed,
         "closedWinCount": closed_win_count,
@@ -4202,6 +5144,12 @@ def process_strategy(
         "realizedPnlUsdt": str(realized_pnl_total),
         "accountCircuitBreaker": circuit_breaker or {},
         "decisions": decisions,
+        "currentCandidateItems": build_signal_rows(candidates),
+        "signalDropGuardActive": suspend_signal_lost_exit,
+        "blockNewEntriesActive": block_new_entries,
+        "blockNewEntriesReason": block_new_entries_reason,
+        "signalSource": signal_source,
+        "signalFetchIssues": signal_fetch_issues or [],
     }
 
 
@@ -4213,12 +5161,18 @@ def run_once(config: BotConfig) -> dict[str, Any]:
     previous_positive_snapshot = load_snapshot_rows(config.positive_snapshot_file)
     previous_negative_snapshot = load_snapshot_rows(config.negative_snapshot_file)
 
-    positive_candidates, negative_candidates = fetch_signal_assets(config)
+    positive_candidates, negative_candidates, signal_meta = fetch_signal_assets(
+        config,
+        previous_positive_snapshot=previous_positive_snapshot,
+        previous_negative_snapshot=previous_negative_snapshot,
+    )
     positive_assets = [normalize_asset(item.get("asset", ""), item.get("baseAsset")) for item in positive_candidates]
     negative_assets = [normalize_asset(item.get("asset", ""), item.get("baseAsset")) for item in negative_candidates]
     prev_positive_assets = [row.get("asset") for row in previous_positive_snapshot if row.get("asset")]
     logging.info(
-        "signal_fetch_result positive=%d negative=%d positive_assets=%s prev_positive_assets=%s",
+        "signal_fetch_result source=%s issues=%s positive=%d negative=%d positive_assets=%s prev_positive_assets=%s",
+        signal_meta.get("source"),
+        signal_meta.get("renderedIssues") or [],
         len(positive_candidates),
         len(negative_candidates),
         positive_assets,
@@ -4250,18 +5204,31 @@ def run_once(config: BotConfig) -> dict[str, Any]:
             len(previous_negative_snapshot),
             len(negative_candidates),
         )
+    long_block_new_entries = bool(signal_meta.get("blockNewEntries")) or suspend_long_signal_lost_exit
+    short_block_new_entries = bool(signal_meta.get("blockNewEntries")) or suspend_short_signal_lost_exit
+    freeze_signal_decisions = bool(signal_meta.get("freezeSignalDecisions"))
+    long_block_reason = (
+        "signal_drop_guard"
+        if suspend_long_signal_lost_exit
+        else ("signal_source_unstable" if signal_meta.get("blockNewEntries") else None)
+    )
+    short_block_reason = (
+        "signal_drop_guard"
+        if suspend_short_signal_lost_exit
+        else ("signal_source_unstable" if signal_meta.get("blockNewEntries") else None)
+    )
 
     preserve_positive_snapshot = should_preserve_previous_snapshot(
         previous_snapshot=previous_positive_snapshot,
         current_candidates=positive_candidates,
         current_position_count=strategy_position_count(state, LONG_STRATEGY_ID, LONG),
-        suspend_signal_lost_exit=suspend_long_signal_lost_exit,
+        suspend_signal_lost_exit=suspend_long_signal_lost_exit or bool(signal_meta.get("blockNewEntries")),
     )
     preserve_negative_snapshot = should_preserve_previous_snapshot(
         previous_snapshot=previous_negative_snapshot,
         current_candidates=negative_candidates,
         current_position_count=strategy_position_count(state, SHORT_STRATEGY_ID, SHORT),
-        suspend_signal_lost_exit=suspend_short_signal_lost_exit,
+        suspend_signal_lost_exit=suspend_short_signal_lost_exit or bool(signal_meta.get("blockNewEntries")),
     )
     if preserve_positive_snapshot:
         logging.warning(
@@ -4315,10 +5282,16 @@ def run_once(config: BotConfig) -> dict[str, Any]:
             strategy_id=LONG_STRATEGY_ID,
             side=LONG,
             candidates=positive_candidates,
+            opposite_candidate_count=len(negative_candidates),
             suspend_signal_lost_exit=suspend_long_signal_lost_exit,
             previous_snapshot=previous_positive_snapshot,
             account_snapshot=account_snapshot,
             circuit_breaker=circuit_breaker,
+            block_new_entries=long_block_new_entries,
+            block_new_entries_reason=long_block_reason,
+            freeze_signal_decisions=freeze_signal_decisions,
+            signal_source=signal_meta.get("source"),
+            signal_fetch_issues=signal_meta.get("renderedIssues") or [],
         )
         state_store.save(state)
 
@@ -4330,10 +5303,16 @@ def run_once(config: BotConfig) -> dict[str, Any]:
             strategy_id=SHORT_STRATEGY_ID,
             side=SHORT,
             candidates=negative_candidates,
+            opposite_candidate_count=len(positive_candidates),
             suspend_signal_lost_exit=suspend_short_signal_lost_exit,
             previous_snapshot=previous_negative_snapshot,
             account_snapshot=account_snapshot,
             circuit_breaker=circuit_breaker,
+            block_new_entries=short_block_new_entries,
+            block_new_entries_reason=short_block_reason,
+            freeze_signal_decisions=freeze_signal_decisions,
+            signal_source=signal_meta.get("source"),
+            signal_fetch_issues=signal_meta.get("renderedIssues") or [],
         )
         state_store.save(state)
     except Exception:
@@ -4381,6 +5360,17 @@ def build_config(workdir: Path) -> BotConfig:
         ),
         enable_min_signal_count_filter=get_env_bool("ENABLE_MIN_SIGNAL_COUNT_FILTER", True),
         min_signal_count_to_open=int(os.getenv("MIN_SIGNAL_COUNT_TO_OPEN", "6")),
+        enable_signal_count_entry_gate=get_env_bool("ENABLE_SIGNAL_COUNT_ENTRY_GATE", False),
+        min_long_signal_count_to_open=int(os.getenv("MIN_LONG_SIGNAL_COUNT_TO_OPEN", "13")),
+        min_short_signal_count_to_open=int(os.getenv("MIN_SHORT_SIGNAL_COUNT_TO_OPEN", "20")),
+        enable_signal_imbalance_filter=get_env_bool("ENABLE_SIGNAL_IMBALANCE_FILTER", True),
+        signal_imbalance_min_count=int(
+            os.getenv(
+                "SIGNAL_IMBALANCE_MIN_COUNT",
+                os.getenv("MIN_SIGNAL_COUNT_TO_OPEN", "6"),
+            )
+        ),
+        signal_imbalance_ratio=float(os.getenv("SIGNAL_IMBALANCE_RATIO", "2")),
         cooldown_minutes=cooldown_minutes,
         required_margin_mode=os.getenv("REQUIRED_MARGIN_MODE", "CROSS").upper(),
         skip_if_margin_mode_unavailable=get_env_bool(
@@ -4429,6 +5419,44 @@ def build_config(workdir: Path) -> BotConfig:
         ),
         signal_lost_exit_confirm_rounds=int(
             os.getenv("SIGNAL_LOST_EXIT_CONFIRM_ROUNDS", "3")
+        ),
+        enable_signal_count_exit=get_env_bool("ENABLE_SIGNAL_COUNT_EXIT", False),
+        long_signal_count_to_close_below=int(
+            os.getenv("LONG_SIGNAL_COUNT_TO_CLOSE_BELOW", "11")
+        ),
+        short_signal_count_to_close_below=int(
+            os.getenv("SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW", "19")
+        ),
+        enable_post_entry_weak_exit=get_env_bool("ENABLE_POST_ENTRY_WEAK_EXIT", False),
+        long_weak_exit_start_minutes=int(
+            os.getenv("LONG_WEAK_EXIT_START_MINUTES", "45")
+        ),
+        long_weak_exit_end_minutes=int(
+            os.getenv("LONG_WEAK_EXIT_END_MINUTES", "90")
+        ),
+        long_weak_exit_min_peak_pnl_pct=float(
+            os.getenv("LONG_WEAK_EXIT_MIN_PEAK_PNL_PCT", "1")
+        ),
+        long_weak_exit_signal_drop_count=int(
+            os.getenv("LONG_WEAK_EXIT_SIGNAL_DROP_COUNT", "2")
+        ),
+        long_weak_exit_rank_drop=int(
+            os.getenv("LONG_WEAK_EXIT_RANK_DROP", "3")
+        ),
+        short_weak_exit_start_minutes=int(
+            os.getenv("SHORT_WEAK_EXIT_START_MINUTES", "30")
+        ),
+        short_weak_exit_end_minutes=int(
+            os.getenv("SHORT_WEAK_EXIT_END_MINUTES", "60")
+        ),
+        short_weak_exit_min_peak_pnl_pct=float(
+            os.getenv("SHORT_WEAK_EXIT_MIN_PEAK_PNL_PCT", "0")
+        ),
+        short_weak_exit_signal_drop_count=int(
+            os.getenv("SHORT_WEAK_EXIT_SIGNAL_DROP_COUNT", "1")
+        ),
+        short_weak_exit_opposite_rebound_count=int(
+            os.getenv("SHORT_WEAK_EXIT_OPPOSITE_REBOUND_COUNT", "1")
         ),
         estimated_taker_fee_rate=float(os.getenv("ESTIMATED_TAKER_FEE_RATE", "0.0005")),
         enable_account_circuit_breaker=get_env_bool("ENABLE_ACCOUNT_CIRCUIT_BREAKER", True),
