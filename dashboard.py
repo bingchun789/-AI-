@@ -2334,11 +2334,27 @@ HTML = """<!doctype html>
         const peakDuration = peakStats.durationMinutes !== null && peakStats.durationMinutes !== undefined
           ? `${fmt(peakStats.durationMinutes, 1)} \u5206\u949f`
           : '-';
+        const gateStats = item?.signalCountEntryGate24h || {};
+        const gateThreshold = gateStats.threshold ?? '-';
+        const gateOccurrences = gateStats.occurrenceCount ?? 0;
+        const gateConfirmed = gateStats.confirmedOccurrenceCount ?? 0;
+        const gateTotalDuration = gateStats.totalDurationMinutes !== null && gateStats.totalDurationMinutes !== undefined
+          ? `${fmt(gateStats.totalDurationMinutes, 1)} \u5206\u949f`
+          : '-';
+        const gateLongestDuration = gateStats.longestDurationMinutes !== null && gateStats.longestDurationMinutes !== undefined
+          ? `${fmt(gateStats.longestDurationMinutes, 1)} \u5206\u949f`
+          : '-';
+        const gateRecentStartedAt = gateStats.recentStartedAt ? fmtCloseTime(gateStats.recentStartedAt) : '-';
+        const gateOpenLabel = item?.side === 'SHORT' ? '\u5f00\u7a7a\u95e8\u69db' : '\u5f00\u591a\u95e8\u69db';
+        const gateEnabledText = gateStats.enabled === false ? '\uff08\u5f00\u5173\u672a\u5f00\uff09' : '';
         const peakHtml = `
           <div style="margin-top:8px;padding-top:8px;border-top:1px dashed #e5e7eb;">
             <div>${peakLabel}: ${escapeHtml(peakCount)} \u4e2a</div>
             <div class="sub">\u51fa\u73b0\u65f6\u95f4: ${escapeHtml(peakStartedAt)}</div>
             <div class="sub">\u6301\u7eed\u65f6\u95f4: ${escapeHtml(peakDuration)}\uff0c\u7ed3\u675f\u65f6\u95f4: ${escapeHtml(peakEndedAt)}</div>
+            <div style="margin-top:6px;">\u0032\u0034\u5c0f\u65f6\u8fbe\u5230${gateOpenLabel}: ${escapeHtml(gateOccurrences)} \u6b21 ${escapeHtml(gateEnabledText)}</div>
+            <div class="sub">\u5f53\u524d\u95e8\u69db: \u2265 ${escapeHtml(gateThreshold)} \u4e2a\uff1b\u6ee1\u8db3\u8fde\u7eed\u0033\u8f6e: ${escapeHtml(gateConfirmed)} \u6b21</div>
+            <div class="sub">\u603b\u6301\u7eed: ${escapeHtml(gateTotalDuration)}\uff0c\u6700\u957f\u6301\u7eed: ${escapeHtml(gateLongestDuration)}\uff0c\u6700\u8fd1\u4e00\u6b21: ${escapeHtml(gateRecentStartedAt)}</div>
           </div>
         `;
         const blockedHtml = openSummary.summaryRows.length

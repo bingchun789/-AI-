@@ -13,6 +13,7 @@ from ai_select_futures_bot import (
     SHORT,
     LONG_STRATEGY_ID,
     SHORT_STRATEGY_ID,
+    SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS,
     build_config,
     estimate_position_max_loss_usdt,
     live_side_from_amount,
@@ -257,6 +258,115 @@ def _build_signal_count_peak_stats(workdir: Path) -> dict[str, dict[str, Any]]:
     return {
         LONG_STRATEGY_ID: _signal_count_peak_stats(rows, "longCount"),
         SHORT_STRATEGY_ID: _signal_count_peak_stats(rows, "shortCount"),
+    }
+
+
+def _signal_count_threshold_stats(
+    rows: list[dict[str, Any]],
+    count_key: str,
+    threshold: int,
+    enabled: bool,
+    confirm_rounds: int,
+) -> dict[str, Any]:
+    if threshold <= 0:
+        return {
+            "enabled": bool(enabled),
+            "threshold": threshold,
+            "confirmRounds": confirm_rounds,
+            "occurrenceCount": 0,
+            "confirmedOccurrenceCount": 0,
+            "totalDurationMinutes": 0,
+            "longestDurationMinutes": None,
+            "longestStartedAt": None,
+            "longestEndedAt": None,
+            "recentStartedAt": None,
+            "recentEndedAt": None,
+            "recentDurationMinutes": None,
+            "sampleCount": len(rows),
+        }
+    segments: list[dict[str, Any]] = []
+    active_start: float | None = None
+    active_last_index: int | None = None
+    active_samples = 0
+    now_ts = time.time()
+
+    def close_segment(next_timestamp: float | None) -> None:
+        nonlocal active_start, active_last_index, active_samples
+        if active_start is None or active_last_index is None:
+            return
+        end_ts = next_timestamp if next_timestamp is not None else now_ts
+        if end_ts < active_start:
+            end_ts = rows[active_last_index]["timestamp"]
+        duration_minutes = float(
+            Decimal(str(max(0, end_ts - active_start))) / Decimal("60")
+        )
+        segments.append(
+            {
+                "startedAt": active_start,
+                "endedAt": end_ts,
+                "durationMinutes": duration_minutes,
+                "sampleCount": active_samples,
+            }
+        )
+        active_start = None
+        active_last_index = None
+        active_samples = 0
+
+    for index, row in enumerate(rows):
+        timestamp = float(row["timestamp"])
+        count = int(row.get(count_key, 0) or 0)
+        if count >= threshold:
+            if active_start is None:
+                active_start = timestamp
+                active_samples = 0
+            active_last_index = index
+            active_samples += 1
+            continue
+        close_segment(timestamp)
+    close_segment(None)
+
+    longest = max(segments, key=lambda item: item["durationMinutes"], default=None)
+    recent = max(segments, key=lambda item: item["startedAt"], default=None)
+    return {
+        "enabled": bool(enabled),
+        "threshold": threshold,
+        "confirmRounds": confirm_rounds,
+        "occurrenceCount": len(segments),
+        "confirmedOccurrenceCount": sum(
+            1 for item in segments if int(item.get("sampleCount") or 0) >= confirm_rounds
+        ),
+        "totalDurationMinutes": sum(item["durationMinutes"] for item in segments),
+        "longestDurationMinutes": longest.get("durationMinutes") if longest else None,
+        "longestStartedAt": longest.get("startedAt") if longest else None,
+        "longestEndedAt": longest.get("endedAt") if longest else None,
+        "recentStartedAt": recent.get("startedAt") if recent else None,
+        "recentEndedAt": recent.get("endedAt") if recent else None,
+        "recentDurationMinutes": recent.get("durationMinutes") if recent else None,
+        "sampleCount": len(rows),
+    }
+
+
+def _build_signal_count_entry_gate_stats(
+    workdir: Path,
+    config: Any,
+) -> dict[str, dict[str, Any]]:
+    rows = _load_signal_count_history(workdir)
+    enabled = bool(getattr(config, "enable_signal_count_entry_gate", False))
+    return {
+        LONG_STRATEGY_ID: _signal_count_threshold_stats(
+            rows,
+            "longCount",
+            int(getattr(config, "min_long_signal_count_to_open", 0) or 0),
+            enabled,
+            SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS,
+        ),
+        SHORT_STRATEGY_ID: _signal_count_threshold_stats(
+            rows,
+            "shortCount",
+            int(getattr(config, "min_short_signal_count_to_open", 0) or 0),
+            enabled,
+            SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS,
+        ),
     }
 
 
@@ -3666,6 +3776,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         SHORT_STRATEGY_ID: _load_signal_snapshot(workdir / "runtime/strong_negative_snapshot.json"),
     }
     signal_count_peak_stats = _build_signal_count_peak_stats(workdir)
+    signal_count_entry_gate_stats = _build_signal_count_entry_gate_stats(workdir, config)
     strategy_statuses = {
         key: {
             **value,
@@ -3673,6 +3784,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             "signalSnapshotCount": signal_snapshots.get(key, {}).get("count", 0),
             "signalSnapshotItems": signal_snapshots.get(key, {}).get("items", []),
             "signalCountPeak24h": signal_count_peak_stats.get(key, {}),
+            "signalCountEntryGate24h": signal_count_entry_gate_stats.get(key, {}),
         }
         for key, value in strategy_statuses.items()
     }
@@ -3813,6 +3925,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             "signalSnapshotCount": snapshot_count,
             "signalSnapshotItems": snapshot_items,
             "signalCountPeak24h": signal_count_peak_stats.get(key, {}),
+            "signalCountEntryGate24h": signal_count_entry_gate_stats.get(key, {}),
             "signalSnapshotIsProtected": _is_signal_snapshot_protected(
                 current_candidate_items,
                 snapshot_items,
