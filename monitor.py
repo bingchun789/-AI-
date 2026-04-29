@@ -128,6 +128,9 @@ def _event_quantity(event: dict[str, Any]) -> Decimal | None:
     quantity = _to_decimal(event.get("quantity"))
     if quantity is not None and quantity > Decimal("0"):
         return abs(quantity)
+    exit_qty = _to_decimal(event.get("exitQty"))
+    if exit_qty is not None and exit_qty > Decimal("0"):
+        return abs(exit_qty)
     entry_notional = _to_decimal(event.get("entryNotionalUsdt"))
     entry_price = _to_decimal(event.get("entryPrice"))
     if entry_notional is None or entry_price in (None, Decimal("0")):
@@ -1707,7 +1710,15 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
         configured_stop_pnl_pct = _event_pnl_pct_for_price(
             event, _to_decimal(audit.get("configuredStopLossPrice"))
         )
+        realized_pnl = _to_decimal(event.get("realizedPnlUsdt"))
+        return_basis = _to_decimal(event.get("returnBasisUsdt"))
+        realized_pnl_pct = (
+            (realized_pnl / return_basis) * Decimal("100")
+            if realized_pnl is not None and return_basis not in (None, Decimal("0"))
+            else None
+        )
         breakeven_like_stop = _is_protective_breakeven_stop(event, audit)
+        stop_loss_tolerance_pct = Decimal("1.0")
         if stop_loss_pct is None:
             failures.append("未记录硬止损阈值")
         elif stop_loss_mode == "breakeven" or (
@@ -1716,8 +1727,13 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
             if not breakeven_activated:
                 failures.append("保本止损平仓缺少保本激活时间记录")
         elif not any(
-            value is not None and value <= -stop_loss_pct
-            for value in (current_pnl_pct, exit_pnl_pct, configured_stop_pnl_pct)
+            value is not None and value <= -(stop_loss_pct - stop_loss_tolerance_pct)
+            for value in (
+                current_pnl_pct,
+                exit_pnl_pct,
+                configured_stop_pnl_pct,
+                realized_pnl_pct,
+            )
         ):
             failures.append(
                 f"当前收益 {audit.get('currentPnlPct') or '-'} 未跌破止损阈值 -{audit.get('stopLossPct') or '-'}"

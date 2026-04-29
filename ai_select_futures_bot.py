@@ -1608,6 +1608,23 @@ def is_signal_count_suspicious(
     return current_count < review_threshold
 
 
+def has_contiguous_signal_ranks(items: list[dict[str, Any]], side: str) -> bool:
+    if not items:
+        return False
+    ranks = [int_or_none(item.get("rank")) for item in items]
+    if any(rank is None for rank in ranks):
+        return False
+    rank_values = [int(rank) for rank in ranks if rank is not None]
+    if side == LONG:
+        return rank_values == list(range(1, len(rank_values) + 1))
+    if side == SHORT:
+        return all(
+            rank_values[index] - rank_values[index + 1] == 1
+            for index in range(len(rank_values) - 1)
+        )
+    return False
+
+
 def find_rendered_signal_issues(
     *,
     rendered_positive: list[dict[str, Any]],
@@ -1630,7 +1647,7 @@ def find_rendered_signal_issues(
         previous_count=previous_positive_count,
         current_count=positive_count,
         min_candidates=config.signal_drop_guard_min_candidates,
-    ):
+    ) and not has_contiguous_signal_ranks(rendered_positive, LONG):
         issues.append(
             f"positive_drop:{positive_count}/{previous_positive_count}"
         )
@@ -1638,7 +1655,7 @@ def find_rendered_signal_issues(
         previous_count=previous_negative_count,
         current_count=negative_count,
         min_candidates=config.signal_drop_guard_min_candidates,
-    ):
+    ) and not has_contiguous_signal_ranks(rendered_negative, SHORT):
         issues.append(
             f"negative_drop:{negative_count}/{previous_negative_count}"
         )
@@ -3170,7 +3187,9 @@ def build_exit_record(
         "status": close_result["status"],
         "reason": reason,
         "exitPrice": close_result.get("exitPrice"),
+        "exitQty": close_result.get("exitQty"),
         "entryPrice": position.get("entryPrice"),
+        "quantity": position.get("quantity"),
         "entryNotionalUsdt": position.get("notionalUsdt"),
         "returnBasisUsdt": position.get("returnBasisUsdt"),
         "openedAt": position.get("openedAt"),
