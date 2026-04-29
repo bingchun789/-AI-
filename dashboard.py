@@ -28,6 +28,7 @@ CONFIG_TOGGLE_KEYS = {
     "ENABLE_STOP_LOSS",
     "ENABLE_PROFIT_LOCK",
     "ENABLE_PROFIT_PROTECTION",
+    "ENABLE_SIGNAL_LOST_EXIT",
     "ENABLE_SIGNAL_DROP_GUARD",
     "ENABLE_SIGNAL_COUNT_EXIT",
     "ENABLE_POST_ENTRY_WEAK_EXIT",
@@ -71,6 +72,7 @@ CONFIG_VALUE_KEYS = {
     "SHORT_WEAK_EXIT_MIN_PEAK_PNL_PCT",
     "SHORT_WEAK_EXIT_SIGNAL_DROP_COUNT",
     "SHORT_WEAK_EXIT_OPPOSITE_REBOUND_COUNT",
+    "SIGNAL_LOST_EXIT_CONFIRM_ROUNDS",
     "PROFIT_PROTECTION_ACTIVATE_PCT",
     "PROFIT_PROTECTION_TRAIL_PCT",
     "BREAKEVEN_TRIGGER_PCT",
@@ -100,6 +102,7 @@ CONFIG_INTEGER_VALUE_KEYS = {
     "SHORT_WEAK_EXIT_END_MINUTES",
     "SHORT_WEAK_EXIT_SIGNAL_DROP_COUNT",
     "SHORT_WEAK_EXIT_OPPOSITE_REBOUND_COUNT",
+    "SIGNAL_LOST_EXIT_CONFIRM_ROUNDS",
 }
 
 RUNTIME_CONTROL_SERVICES = (
@@ -1437,6 +1440,7 @@ HTML = """<!doctype html>
       }
       const map = {
         signal_lost: '掉出当前列表',
+        signal_lost_exit_disabled: '掉榜平仓已关闭',
         snapshot_protection: '快照保护（上轮仍在列表，本轮抓取可能遗漏）',
         signal_drop_guard: '信号骤降保护',
         signal_source_unstable: '信号源抓取异常，本轮不参与判断',
@@ -1852,6 +1856,7 @@ HTML = """<!doctype html>
         ['signal_drop_guard', '信号骤降保护'],
         ['snapshot_protection', '快照保护'],
         ['signal_lost', '掉出当前列表'],
+        ['signal_lost_exit_disabled', '掉榜平仓已关闭'],
         ['profit_lock', '分级锁盈平仓'],
         ['profit_retrace', '盈利回撤保护平仓'],
         ['time_exit', '持仓时间过长平仓'],
@@ -3142,6 +3147,8 @@ HTML = """<!doctype html>
           'PROFIT_PROTECTION_ACTIVATE_PCT',
           'PROFIT_PROTECTION_TRAIL_PCT',
           'ENABLE_TIME_EXIT',
+          'ENABLE_SIGNAL_LOST_EXIT',
+          'SIGNAL_LOST_EXIT_CONFIRM_ROUNDS',
           'ENABLE_SIGNAL_DROP_GUARD',
         ],
       },

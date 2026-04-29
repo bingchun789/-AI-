@@ -366,8 +366,13 @@ def _build_rule_summary(config: Any) -> list[dict[str, str]]:
     leverage_text = f"{config.leverage}X {('逐仓' if config.required_margin_mode == 'ISOLATED' else config.required_margin_mode)}"
     activate_pct = config.profit_protection_activate_pct
     trail_pct = config.profit_protection_trail_pct
+    signal_lost_text = (
+        f"在榜继续持有，掉出榜单连续 {config.signal_lost_exit_confirm_rounds} 轮确认后平仓"
+        if config.enable_signal_lost_exit
+        else "在榜继续持有；掉出榜单只记录，不按掉榜自动平仓"
+    )
     return [
-        {"title": "多空主逻辑", "value": "在榜继续持有，掉出榜单就平仓"},
+        {"title": "多空主逻辑", "value": signal_lost_text},
         {"title": "杠杆模式", "value": f"做多 {leverage_text}，做空 {leverage_text}"},
         {"title": "冷却时间", "value": f"平仓后 {cooldown_label} 内不重开同方向"},
         {
@@ -534,6 +539,26 @@ def _build_config_toggles(config: Any) -> list[dict[str, Any]]:
             "detail": "\u542f\u52a8\u540e\uff0c\u82e5\u5f53\u524d\u6536\u76ca\u8f83\u5386\u53f2\u5cf0\u503c\u56de\u64a4\u5230\u8fd9\u4e2a\u6bd4\u4f8b\uff0c\u5219\u6267\u884c\u5e73\u4ed3\u3002",
         },
         {
+            "key": "ENABLE_SIGNAL_LOST_EXIT",
+            "label": "掉榜平仓",
+            "enabled": config.enable_signal_lost_exit,
+            "detail": (
+                f"开启后，持仓币种连续 {config.signal_lost_exit_confirm_rounds} 轮不在当前强烈看多/看空榜单内才平仓；"
+                "关闭后，掉榜只记录，不会因为掉榜自动平仓。"
+            ),
+        },
+        {
+            "key": "SIGNAL_LOST_EXIT_CONFIRM_ROUNDS",
+            "label": "掉榜确认轮数",
+            "type": "number",
+            "value": int(config.signal_lost_exit_confirm_rounds),
+            "min": 1,
+            "step": 1,
+            "unit": "轮",
+            "showWhen": {"key": "ENABLE_SIGNAL_LOST_EXIT"},
+            "detail": "持仓币种连续多少轮不在当前榜单里，才确认执行掉榜平仓。",
+        },
+        {
             "key": "ENABLE_SIGNAL_DROP_GUARD",
             "label": "信号骤降保护",
             "enabled": config.enable_signal_drop_guard,
@@ -586,6 +611,14 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
             f"做空少于 {config.short_signal_count_to_close_below} 个平全部做空仓"
             if config.enable_signal_count_exit
             else "已关闭"
+        ),
+    }
+    signal_lost_rule = {
+        "title": "掉榜平仓",
+        "value": (
+            f"开启，连续 {config.signal_lost_exit_confirm_rounds} 轮掉出当前榜单后平仓"
+            if config.enable_signal_lost_exit
+            else "已关闭，掉出榜单只记录，不自动平仓"
         ),
     }
     post_entry_weak_rule = {
@@ -645,6 +678,7 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
         entry_gate_rule,
         imbalance_rule,
         exit_gate_rule,
+        signal_lost_rule,
         post_entry_weak_rule,
         *new_rules,
         *items[5:],

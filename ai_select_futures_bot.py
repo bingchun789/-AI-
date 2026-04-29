@@ -152,6 +152,7 @@ class BotConfig:
     enable_profit_protection: bool
     profit_protection_activate_pct: float
     profit_protection_trail_pct: float
+    enable_signal_lost_exit: bool
     enable_signal_drop_guard: bool
     signal_drop_guard_ratio: float
     signal_drop_guard_min_candidates: int
@@ -2907,6 +2908,7 @@ def build_exit_audit_record(
             config.partial_take_profit_close_ratio
         ),
         "partialTakeProfitDoneAt": position.get("partialTakeProfitDoneAt"),
+        "signalLostExitEnabled": bool(config.enable_signal_lost_exit),
         "signalLostRounds": int(position.get("signalLostRounds", 0) or 0),
         "signalLostConfirmRounds": int(config.signal_lost_exit_confirm_rounds),
         "exchangePositionMissing": reason == "exchange_position_missing",
@@ -4383,6 +4385,17 @@ def process_strategy(
         if position["asset"] in candidate_assets:
             position["signalLostRounds"] = 0
             continue
+        if not config.enable_signal_lost_exit:
+            position["signalLostRounds"] = 0
+            decisions.append(
+                {
+                    "asset": position["asset"],
+                    "side": side,
+                    "action": "hold",
+                    "reason": "signal_lost_exit_disabled",
+                }
+            )
+            continue
         if suspend_signal_lost_exit:
             position["signalLostRounds"] = 0
             decisions.append(
@@ -5412,6 +5425,7 @@ def build_config(workdir: Path) -> BotConfig:
         profit_protection_trail_pct=float(
             os.getenv("PROFIT_PROTECTION_TRAIL_PCT", "3")
         ),
+        enable_signal_lost_exit=get_env_bool("ENABLE_SIGNAL_LOST_EXIT", True),
         enable_signal_drop_guard=get_env_bool("ENABLE_SIGNAL_DROP_GUARD", True),
         signal_drop_guard_ratio=float(os.getenv("SIGNAL_DROP_GUARD_RATIO", "0.7")),
         signal_drop_guard_min_candidates=int(
