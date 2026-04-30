@@ -2789,6 +2789,7 @@ def _build_trade_history_from_close_events(
             {
                 "timestamp": event.get("timestamp"),
                 "timeMs": event.get("closedAtMs"),
+                "openedAt": event.get("openedAt") or (entry_event or {}).get("timestamp"),
                 "symbol": event.get("contractSymbol"),
                 "asset": event.get("asset"),
                 "side": "SELL" if side == LONG else "BUY",

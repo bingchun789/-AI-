@@ -3965,10 +3965,10 @@ HTML = """<!doctype html>
         return `
         <tr>
           <td>${fmtCloseTime(row.timeMs)}</td>
+          <td>${fmtCloseTime(row.openedAt)}</td>
           <td><span class="pill ${row.direction === '做空' ? 'short' : 'long'}">${row.direction || '-'}</span></td>
           <td>${row.symbol || '-'}</td>
           <td>${row.action || '-'}</td>
-          <td>${row.type || '-'}</td>
           <td>${fmt(row.price, 6)}</td>
           <td>${row.quantity || '-'}</td>
           <td>${formatEntrySignalPair(row.entryStrongLongCount, row.entryStrongShortCount)}</td>
@@ -3990,11 +3990,11 @@ HTML = """<!doctype html>
           <table>
             <thead>
               <tr>
-                <th>时间</th>
+                <th>平仓时间</th>
+                <th>开仓时间</th>
                 <th>方向</th>
                 <th>合约</th>
                 <th>操作</th>
-                <th>订单类型</th>
                 <th>成交价</th>
                 <th>数量</th>
                 <th>开仓时强烈多/空</th>
