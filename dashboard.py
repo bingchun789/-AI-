@@ -1908,6 +1908,7 @@ HTML = """<!doctype html>
     }
 
     function renderBlockSummary(targetId, item) {
+      const winRate = item.closedCount ? (Number(item.closedWinCount || 0) / Number(item.closedCount || 0)) * 100 : null;
       const el = document.getElementById(targetId);
       el.innerHTML = `
         <div class="value ${clsByPnl(item.unrealizedProfit)}">${fmt(item.unrealizedProfit, 4)} USDT</div>
@@ -1917,6 +1918,7 @@ HTML = """<!doctype html>
           <div class="overview-line"><span>持仓价值</span><strong>${fmt(item.currentValueUsdt, 2)} USDT</strong></div>
           <div class="overview-line"><span>已实现盈亏</span><strong class="${clsByPnl(item.realizedPnlUsdt)}">${fmt(item.realizedPnlUsdt, 4)} USDT</strong></div>
           <div class="overview-line"><span>已平仓</span><strong>${item.closedCount} 个</strong></div>
+          <div class="overview-line"><span>胜率</span><strong>${winRate === null ? '-' : fmt(winRate, 2) + '%'}</strong></div>
         </div>
       `;
     }
@@ -1951,6 +1953,7 @@ HTML = """<!doctype html>
     }
 
     function renderBlockSummary(targetId, item) {
+      const winRate = item.closedCount ? (Number(item.closedWinCount || 0) / Number(item.closedCount || 0)) * 100 : null;
       const el = document.getElementById(targetId);
       el.innerHTML = `
         <div class="value ${clsByPnl(item.unrealizedProfit)}">${fmt(item.unrealizedProfit, 4)} USDT</div>
@@ -1961,6 +1964,7 @@ HTML = """<!doctype html>
           <div class="overview-line"><span>已实现(含分批止盈)</span><strong class="${clsByPnl(item.realizedPnlUsdt)}">${fmt(item.realizedPnlUsdt, 4)} USDT</strong></div>
           <div class="overview-line"><span>分批止盈</span><strong>${item.partialTakeProfitCount ?? 0} 次</strong></div>
           <div class="overview-line"><span>已平仓</span><strong>${item.closedCount} 个</strong></div>
+          <div class="overview-line"><span>胜率</span><strong>${winRate === null ? '-' : fmt(winRate, 2) + '%'}</strong></div>
         </div>
       `;
     }
