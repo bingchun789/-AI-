@@ -1472,6 +1472,7 @@ HTML = """<!doctype html>
         profit_retrace: '盈利回撤保护平仓',
         time_exit: '持仓时间过长平仓',
         stop_loss: '触发硬止损平仓',
+        stop_loss_setup_failed: '保护止损挂单失败后撤退',
         exchange_position_missing: '交易所侧持仓已消失',
         still_strong_positive: '仍在强烈看多列表',
         still_strong_negative: '仍在强烈看空列表',
