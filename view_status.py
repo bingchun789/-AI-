@@ -2336,6 +2336,24 @@ def _entry_signal_counts(side: str, audit: Any) -> tuple[int | None, int | None]
     return (same_side_count, opposite_count)
 
 
+def _exit_signal_counts(side: str, audit: Any) -> tuple[int | None, int | None]:
+    if not isinstance(audit, dict):
+        return (None, None)
+    long_count = _int_or_none(audit.get("exitStrongLongCount"))
+    short_count = _int_or_none(audit.get("exitStrongShortCount"))
+    if long_count is not None or short_count is not None:
+        return (long_count, short_count)
+    same_side_count = _int_or_none(
+        audit.get("currentSignalCount") or audit.get("exitCandidateCount")
+    )
+    opposite_count = _int_or_none(
+        audit.get("currentOppositeSignalCount") or audit.get("exitOppositeCandidateCount")
+    )
+    if side == SHORT:
+        return (opposite_count, same_side_count)
+    return (same_side_count, opposite_count)
+
+
 def _signal_count_bucket(count: int) -> tuple[str, int]:
     count = max(int(count or 0), 0)
     if count <= 5:
@@ -2751,6 +2769,10 @@ def _build_trade_history_from_close_events(
             side,
             (entry_event or {}).get("audit"),
         )
+        exit_long_count, exit_short_count = _exit_signal_counts(
+            side,
+            event.get("audit"),
+        )
         reason = str(event.get("reason") or "").lower()
         order_type = "MARKET"
         action_label = "平仓"
@@ -2808,6 +2830,8 @@ def _build_trade_history_from_close_events(
                 "realizedPnlPct": realized_pnl_pct,
                 "entryStrongLongCount": entry_long_count,
                 "entryStrongShortCount": entry_short_count,
+                "exitStrongLongCount": exit_long_count,
+                "exitStrongShortCount": exit_short_count,
             }
         )
     return items

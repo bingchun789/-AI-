@@ -1566,6 +1566,15 @@ HTML = """<!doctype html>
       return `${longLabel}/${shortLabel}`;
     }
 
+    function formatEntryExitSignalPair(row) {
+      const entryPair = formatEntrySignalPair(row.entryStrongLongCount, row.entryStrongShortCount);
+      const exitPair = formatEntrySignalPair(row.exitStrongLongCount, row.exitStrongShortCount);
+      if (entryPair === '-' && exitPair === '-') {
+        return '-';
+      }
+      return `${entryPair}-${exitPair}`;
+    }
+
     function escapeHtml(value) {
       return String(value ?? '-')
         .replaceAll('&', '&amp;')
@@ -3971,7 +3980,7 @@ HTML = """<!doctype html>
           <td>${row.action || '-'}</td>
           <td>${fmt(row.price, 6)}</td>
           <td>${row.quantity || '-'}</td>
-          <td>${formatEntrySignalPair(row.entryStrongLongCount, row.entryStrongShortCount)}</td>
+          <td>${formatEntryExitSignalPair(row)}</td>
           ${pnlCell}
           ${pnlPctCell}
           ${reasonCell}
@@ -3997,7 +4006,7 @@ HTML = """<!doctype html>
                 <th>操作</th>
                 <th>成交价</th>
                 <th>数量</th>
-                <th>开仓时强烈多/空</th>
+                <th>开仓/平仓时强烈多/空</th>
                 <th>盈亏</th>
                 <th>收益率</th>
                 <th>平仓原因</th>

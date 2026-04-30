@@ -3082,6 +3082,26 @@ def build_exit_audit_record(
     }
 
 
+def enrich_exit_audit_with_signal_counts(
+    audit: dict[str, Any],
+    *,
+    side: str,
+    candidate_count: int,
+    opposite_candidate_count: int,
+) -> dict[str, Any]:
+    if side == SHORT:
+        long_count = opposite_candidate_count
+        short_count = candidate_count
+    else:
+        long_count = candidate_count
+        short_count = opposite_candidate_count
+    audit["exitStrongLongCount"] = int(long_count or 0)
+    audit["exitStrongShortCount"] = int(short_count or 0)
+    audit["exitCandidateCount"] = int(candidate_count or 0)
+    audit["exitOppositeCandidateCount"] = int(opposite_candidate_count or 0)
+    return audit
+
+
 def calculate_roundtrip_fee(
     *,
     entry_notional_raw: str | float | int | None,
@@ -3897,6 +3917,25 @@ def process_strategy(
     closed = 0
     account_snapshot_cache: dict[str, Any] | None = account_snapshot
 
+    def make_exit_audit(
+        *,
+        config: BotConfig,
+        position: dict[str, Any],
+        reason: str,
+        tracking: dict[str, Decimal | None] | None = None,
+    ) -> dict[str, Any]:
+        return enrich_exit_audit_with_signal_counts(
+            build_exit_audit_record(
+                config=config,
+                position=position,
+                reason=reason,
+                tracking=tracking,
+            ),
+            side=side,
+            candidate_count=candidate_count,
+            opposite_candidate_count=opposite_candidate_count,
+        )
+
     current_positions = {
         key: position
         for key, position in state.get("positions", {}).items()
@@ -3958,7 +3997,7 @@ def process_strategy(
                 resolved_reason,
                 close_result.get("orderId"),
             )
-        exit_audit = build_exit_audit_record(
+        exit_audit = make_exit_audit(
             config=config,
             position=position,
             reason=resolved_reason,
@@ -4048,7 +4087,7 @@ def process_strategy(
             current_pnl_pct=tracking["current"],
         ):
             partial_ratio = Decimal(str(config.partial_take_profit_close_ratio))
-            partial_audit = build_exit_audit_record(
+            partial_audit = make_exit_audit(
                 config=config,
                 position=position,
                 reason="partial_take_profit",
@@ -4185,7 +4224,7 @@ def process_strategy(
             config=config,
             current_pnl_pct=tracking["current"],
         ):
-            exit_audit = build_exit_audit_record(
+            exit_audit = make_exit_audit(
                 config=config,
                 position=position,
                 reason="stop_loss",
@@ -4244,7 +4283,7 @@ def process_strategy(
             current_pnl_pct=tracking["current"],
             peak_pnl_pct=tracking["peak"],
         ):
-            exit_audit = build_exit_audit_record(
+            exit_audit = make_exit_audit(
                 config=config,
                 position=position,
                 reason="profit_lock",
@@ -4300,7 +4339,7 @@ def process_strategy(
             current_pnl_pct=tracking["current"],
             peak_pnl_pct=tracking["peak"],
         ):
-            exit_audit = build_exit_audit_record(
+            exit_audit = make_exit_audit(
                 config=config,
                 position=position,
                 reason="profit_retrace",
@@ -4364,7 +4403,7 @@ def process_strategy(
             position=position,
             current_pnl_pct=tracking["current"],
         ):
-            exit_audit = build_exit_audit_record(
+            exit_audit = make_exit_audit(
                 config=config,
                 position=position,
                 reason="time_exit",
@@ -4440,7 +4479,7 @@ def process_strategy(
             suspend_signal_lost_exit=suspend_signal_lost_exit,
         )
         if weak_exit_context is not None:
-            exit_audit = build_exit_audit_record(
+            exit_audit = make_exit_audit(
                 config=config,
                 position=position,
                 reason="post_entry_weakness_exit",
@@ -4540,7 +4579,7 @@ def process_strategy(
                     }
                 )
                 continue
-            exit_audit = build_exit_audit_record(
+            exit_audit = make_exit_audit(
                 config=config,
                 position=position,
                 reason="signal_count_below_exit_threshold",
@@ -4690,7 +4729,7 @@ def process_strategy(
             close_result=close_result,
             reason="signal_lost",
             fee_rate=fee_rate,
-            audit=build_exit_audit_record(
+            audit=make_exit_audit(
                 config=config,
                 position=position,
                 reason="signal_lost",
@@ -5334,6 +5373,12 @@ def process_strategy(
                 config=config,
                 position=opened_position,
                 reason="stop_loss_setup_failed",
+            )
+            enrich_exit_audit_with_signal_counts(
+                emergency_audit,
+                side=side,
+                candidate_count=candidate_count,
+                opposite_candidate_count=opposite_candidate_count,
             )
             emergency_audit["stopLossSetupResult"] = stop_loss_result or {}
             emergency_close_result = broker.close_position(
