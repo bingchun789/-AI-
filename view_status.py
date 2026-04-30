@@ -2343,15 +2343,37 @@ def _exit_signal_counts(side: str, audit: Any) -> tuple[int | None, int | None]:
     short_count = _int_or_none(audit.get("exitStrongShortCount"))
     if long_count is not None or short_count is not None:
         return (long_count, short_count)
-    same_side_count = _int_or_none(
-        audit.get("currentSignalCount") or audit.get("exitCandidateCount")
-    )
-    opposite_count = _int_or_none(
-        audit.get("currentOppositeSignalCount") or audit.get("exitOppositeCandidateCount")
-    )
+    same_side_count = _int_or_none(audit.get("currentSignalCount"))
+    if same_side_count is None:
+        same_side_count = _int_or_none(audit.get("exitCandidateCount"))
+    opposite_count = _int_or_none(audit.get("currentOppositeSignalCount"))
+    if opposite_count is None:
+        opposite_count = _int_or_none(audit.get("exitOppositeCandidateCount"))
     if side == SHORT:
         return (opposite_count, same_side_count)
     return (same_side_count, opposite_count)
+
+
+def _signal_counts_near_timestamp(
+    rows: list[dict[str, Any]],
+    timestamp: Any,
+    *,
+    max_gap_seconds: float = 5 * 60,
+) -> tuple[int | None, int | None]:
+    target = _coerce_timestamp_seconds(timestamp)
+    if target is None or not rows:
+        return (None, None)
+    best_row = min(
+        rows,
+        key=lambda row: abs(float(row.get("timestamp", 0) or 0) - target),
+    )
+    best_ts = _coerce_timestamp_seconds(best_row.get("timestamp"))
+    if best_ts is None or abs(best_ts - target) > max_gap_seconds:
+        return (None, None)
+    return (
+        _int_or_none(best_row.get("longCount")),
+        _int_or_none(best_row.get("shortCount")),
+    )
 
 
 def _signal_count_bucket(count: int) -> tuple[str, int]:
@@ -2750,6 +2772,7 @@ def _build_trade_history_from_close_events(
     close_events: list[dict[str, Any]],
     realized_events: list[dict[str, Any]] | None = None,
     all_history: list[dict[str, Any]] | None = None,
+    signal_count_history: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     merged_events = list(close_events)
@@ -2773,6 +2796,15 @@ def _build_trade_history_from_close_events(
             side,
             event.get("audit"),
         )
+        if exit_long_count is None or exit_short_count is None:
+            fallback_long_count, fallback_short_count = _signal_counts_near_timestamp(
+                signal_count_history or [],
+                event.get("closedAtMs") or event.get("timestamp"),
+            )
+            if exit_long_count is None:
+                exit_long_count = fallback_long_count
+            if exit_short_count is None:
+                exit_short_count = fallback_short_count
         reason = str(event.get("reason") or "").lower()
         order_type = "MARKET"
         action_label = "平仓"
@@ -3817,7 +3849,11 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         LONG_STRATEGY_ID: _load_signal_snapshot(workdir / "runtime/strong_positive_snapshot.json"),
         SHORT_STRATEGY_ID: _load_signal_snapshot(workdir / "runtime/strong_negative_snapshot.json"),
     }
-    signal_count_peak_stats = _build_signal_count_peak_stats(workdir)
+    signal_count_history = _load_signal_count_history(workdir)
+    signal_count_peak_stats = {
+        LONG_STRATEGY_ID: _signal_count_peak_stats(signal_count_history, "longCount"),
+        SHORT_STRATEGY_ID: _signal_count_peak_stats(signal_count_history, "shortCount"),
+    }
     signal_count_entry_gate_stats = _build_signal_count_entry_gate_stats(workdir, config)
     strategy_statuses = {
         key: {
@@ -4050,6 +4086,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
         closed_history,
         realized_history,
         all_history,
+        signal_count_history,
     )[:20]
     total_realized = sum(
         (
