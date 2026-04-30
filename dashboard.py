@@ -288,7 +288,8 @@ HTML = """<!doctype html>
       font-size: 13px;
     }
     .hero-status {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
       gap: 10px;
       align-items: flex-start;
       min-height: 52px;
@@ -397,7 +398,8 @@ HTML = """<!doctype html>
       position: sticky;
       top: 10px;
       z-index: 20;
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
       gap: 10px;
       padding: 10px;
       border-radius: 24px;
@@ -405,11 +407,11 @@ HTML = """<!doctype html>
       background: rgba(249,245,238,.78);
       backdrop-filter: blur(12px);
       box-shadow: var(--shadow-soft);
-      overflow-x: auto;
+      overflow-x: visible;
     }
     .tab-btn {
       border: 0;
-      min-width: 132px;
+      min-width: 0;
       border-radius: 18px;
       padding: 12px 16px;
       background: transparent;
