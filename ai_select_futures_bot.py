@@ -2898,6 +2898,21 @@ def ensure_stop_loss_with_retries(
     return failed
 
 
+def is_breakeven_stop_setup_failure(
+    position: dict[str, Any],
+    stop_loss_result: dict[str, Any] | None,
+) -> bool:
+    if not stop_loss_result:
+        return False
+    if stop_loss_result.get("configured"):
+        return False
+    return (
+        position.get("stopLossMode") == "breakeven"
+        or position.get("breakevenActivatedAt") not in (None, "")
+        or stop_loss_result.get("mode") == "breakeven"
+    )
+
+
 def build_entry_audit_record(
     *,
     config: BotConfig,
@@ -4220,6 +4235,69 @@ def process_strategy(
             config=config,
             stop_loss_result=stop_loss_result,
         )
+        if is_breakeven_stop_setup_failure(position, stop_loss_result):
+            exit_audit = make_exit_audit(
+                config=config,
+                position=position,
+                reason="breakeven_stop_setup_failed",
+                tracking=tracking,
+            )
+            exit_audit["stopLossSetupResult"] = stop_loss_result or {}
+            close_result = broker.close_position(
+                contract_symbol=position["contractSymbol"],
+                asset=position["asset"],
+                side=side,
+                position=position,
+                dry_run=config.dry_run,
+            )
+            if not is_close_result_success(close_result):
+                failed_decision = build_close_failed_decision(
+                    position=position,
+                    side=side,
+                    attempted_reason="breakeven_stop_setup_failed",
+                    close_result=close_result,
+                )
+                failed_decision.update(
+                    {
+                        "detail": "保本止损切换失败，尝试主动平仓也失败。",
+                        "stopLossStatus": (stop_loss_result or {}).get("status"),
+                        "stopLossAttempts": (stop_loss_result or {}).get("attempts"),
+                        "stopLossErrors": (stop_loss_result or {}).get("errors") or [],
+                    }
+                )
+                decisions.append(failed_decision)
+                continue
+            exit_event = build_exit_record(
+                asset=position["asset"],
+                side=side,
+                strategy_id=strategy_id,
+                position=position,
+                close_result=close_result,
+                reason="breakeven_stop_setup_failed",
+                fee_rate=fee_rate,
+                audit=exit_audit,
+            )
+            state.setdefault("history", []).append(exit_event)
+            state.get("positions", {}).pop(key, None)
+            decisions.append(
+                {
+                    "asset": position["asset"],
+                    "side": side,
+                    "action": exit_action(side),
+                    "contractSymbol": position["contractSymbol"],
+                    "status": close_result["status"],
+                    "reason": "breakeven_stop_setup_failed",
+                    "detail": "保本止损切换失败，已主动平仓撤退。",
+                    "stopLossStatus": (stop_loss_result or {}).get("status"),
+                    "stopLossAttempts": (stop_loss_result or {}).get("attempts"),
+                    "stopLossErrors": (stop_loss_result or {}).get("errors") or [],
+                    "realizedPnlUsdt": exit_event["realizedPnlUsdt"],
+                    "netRealizedPnlUsdt": exit_event["netRealizedPnlUsdt"],
+                    "closeSide": exit_event["closeSide"],
+                }
+            )
+            closed += 1
+            continue
         if should_trigger_stop_loss(
             config=config,
             current_pnl_pct=tracking["current"],

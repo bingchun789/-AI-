@@ -1451,6 +1451,12 @@ HTML = """<!doctype html>
       if (value === 'contract_not_trading') {
         return '合约已存在，但当前环境未开通交易';
       }
+      if (value === 'breakeven_stop_setup_failed') {
+        return '保本止损挂单失败主动平仓';
+      }
+      if (value === 'stop_loss' && stopLossMode === 'breakeven' && context?.stopLossStatus === 'STOP_LOSS_SETUP_FAILED') {
+        return '保本止损挂单失败，旧止损触发';
+      }
       if (value === 'stop_loss' && stopLossMode === 'breakeven') {
         return '浮盈后保本平仓';
       }
@@ -1472,6 +1478,7 @@ HTML = """<!doctype html>
         profit_retrace: '盈利回撤保护平仓',
         time_exit: '持仓时间过长平仓',
         stop_loss: '触发硬止损平仓',
+        breakeven_stop_setup_failed: '保本止损挂单失败主动平仓',
         stop_loss_setup_failed: '保护止损挂单失败后撤退',
         exchange_position_missing: '交易所侧持仓已消失',
         still_strong_positive: '仍在强烈看多列表',

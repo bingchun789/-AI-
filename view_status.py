@@ -2856,6 +2856,8 @@ def _build_trade_history_from_close_events(
                 "orderId": str(event.get("orderId", "")),
                 "isClose": True,
                 "closeReason": event.get("reason"),
+                "stopLossStatus": event.get("stopLossStatus")
+                or (event.get("audit") or {}).get("stopLossStatus"),
                 "stopLossMode": event.get("stopLossMode"),
                 "breakevenActivatedAt": event.get("breakevenActivatedAt"),
                 "realizedPnlUsdt": realized_pnl,
