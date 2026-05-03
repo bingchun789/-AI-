@@ -734,12 +734,9 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
         return self._quote_volume_cache[contract_symbol]
 
     def get_last_funding_rate_pct(self, contract_symbol: str) -> Decimal:
-        if contract_symbol not in self._funding_rate_cache:
-            payload = self._public_get("/fapi/v1/premiumIndex", {"symbol": contract_symbol})
-            self._funding_rate_cache[contract_symbol] = (
-                Decimal(str(payload.get("lastFundingRate", "0"))) * Decimal("100")
-            )
-        return self._funding_rate_cache[contract_symbol]
+        # Funding rate is an entry gate, so it must reflect the latest exchange value.
+        payload = self._public_get("/fapi/v1/premiumIndex", {"symbol": contract_symbol})
+        return Decimal(str(payload.get("lastFundingRate", "0"))) * Decimal("100")
 
     def get_klines(
         self, contract_symbol: str, interval: str, limit: int
@@ -2904,13 +2901,18 @@ def is_breakeven_stop_setup_failure(
 ) -> bool:
     if not stop_loss_result:
         return False
-    if stop_loss_result.get("configured"):
-        return False
-    return (
+    in_breakeven_mode = (
         position.get("stopLossMode") == "breakeven"
         or position.get("breakevenActivatedAt") not in (None, "")
         or stop_loss_result.get("mode") == "breakeven"
     )
+    if not in_breakeven_mode:
+        return False
+    if stop_loss_result.get("status") == "STOP_LOSS_REPLACE_FAILED_OLD_PROTECTED":
+        return True
+    if stop_loss_result.get("configured"):
+        return False
+    return True
 
 
 def build_entry_audit_record(
@@ -5090,6 +5092,9 @@ def process_strategy(
                         "action": "skip",
                         "reason": "funding_too_high",
                         "fundingRatePct": format(funding_rate_pct, "f"),
+                        "maxAbsFundingRatePct": format_decimal_value(
+                            config.max_abs_funding_rate_pct
+                        ),
                     }
                 )
                 continue
