@@ -2384,13 +2384,17 @@ def _signal_count_bucket(count: int) -> tuple[str, int]:
         return ("6-9 个", 1)
     if count <= 12:
         return ("10-12 个", 2)
-    if count <= 15:
-        return ("13-15 个", 3)
+    if count == 13:
+        return ("13 个", 3)
+    if count == 14:
+        return ("14 个", 4)
+    if count == 15:
+        return ("15 个", 5)
     if count <= 19:
-        return ("16-19 个", 4)
+        return ("16-19 个", 6)
     if count <= 22:
-        return ("20-22 个", 5)
-    return ("23 个以上", 6)
+        return ("20-22 个", 7)
+    return ("23 个以上", 8)
 
 
 def _make_signal_density_bucket(label: str, order: int) -> dict[str, Any]:
