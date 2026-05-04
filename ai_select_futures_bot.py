@@ -1379,6 +1379,12 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
                     "mode": "breakeven" if position.get("stopLossOverridePrice") else "fixed",
                 }
 
+        previous_stop_price = (
+            self._protective_stop_trigger_price(protective_orders[0])
+            if protective_orders
+            else None
+        )
+
         def submit_stop_order() -> dict[str, Any]:
             return self._signed_request(
                 "POST",
@@ -1394,13 +1400,28 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
                 },
             )
 
+        lingering_protective_orders: list[dict[str, Any]] = []
+        if protective_orders:
+            self._cancel_protective_stop_orders(contract_symbol, side)
+            time.sleep(0.2)
+            lingering_protective_orders = [
+                order
+                for order in [
+                    *self._list_open_orders(contract_symbol),
+                    *self._list_open_algo_orders(contract_symbol),
+                ]
+                if self._is_protective_stop_order(order, order_side)
+            ]
+
         try:
             result = submit_stop_order()
         except Exception as exc:
-            if protective_orders:
-                existing_stop_price = self._protective_stop_trigger_price(protective_orders[0])
+            if lingering_protective_orders:
+                existing_stop_price = self._protective_stop_trigger_price(
+                    lingering_protective_orders[0]
+                )
                 logging.warning(
-                    "stop_loss_replace_failed_old_order_kept symbol=%s side=%s requested=%s existing=%s error=%s",
+                    "stop_loss_replace_failed_old_order_still_present symbol=%s side=%s requested=%s existing=%s error=%s",
                     contract_symbol,
                     side,
                     format(stop_price, "f"),
@@ -1419,6 +1440,26 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
                     "mode": position.get("stopLossMode") or "fixed",
                     "error": str(exc),
                 }
+            if protective_orders:
+                logging.error(
+                    "stop_loss_replace_failed_after_cancel symbol=%s side=%s requested=%s previous=%s error=%s",
+                    contract_symbol,
+                    side,
+                    format(stop_price, "f"),
+                    format_decimal_value(previous_stop_price),
+                    exc,
+                )
+                return {
+                    "orderId": None,
+                    "status": "STOP_LOSS_REPLACE_FAILED_AFTER_CANCEL",
+                    "configured": False,
+                    "stopPrice": None,
+                    "requestedStopPrice": format(stop_price, "f"),
+                    "previousStopPrice": format_decimal_value(previous_stop_price),
+                    "stopLossPct": format_decimal_value(stop_loss_pct),
+                    "mode": position.get("stopLossMode") or "fixed",
+                    "error": str(exc),
+                }
             raise
 
         new_order_ids = {
@@ -1430,15 +1471,15 @@ class BinanceTestnetBrokerAdapter(BrokerAdapter):
             )
             if value not in (None, "")
         }
-        if protective_orders and new_order_ids:
+        if lingering_protective_orders and new_order_ids:
             self._cancel_protective_stop_orders(
                 contract_symbol,
                 side,
                 keep_order_ids=new_order_ids,
             )
-        elif protective_orders:
+        elif lingering_protective_orders:
             logging.warning(
-                "stop_loss_new_order_missing_id_old_orders_kept symbol=%s side=%s requested=%s result=%s",
+                "stop_loss_new_order_missing_id_old_orders_still_present symbol=%s side=%s requested=%s result=%s",
                 contract_symbol,
                 side,
                 format(stop_price, "f"),
