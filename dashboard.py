@@ -2051,6 +2051,7 @@ HTML = """<!doctype html>
           <td>${fmt(row.entryPrice, 6)}</td>
           <td>${fmt(row.markPrice, 6)}</td>
           <td>${fmt(row.positionUsdt, 2)} U</td>
+          <td>${fmt(row.returnBasisUsdt, 2)} U</td>
           <td>${fmt(row.currentValueUsdt, 2)} U</td>
           <td class="${clsByPnl(row.unrealizedProfit)}">${fmt(row.unrealizedProfit, 4)} USDT</td>
           <td class="${clsByPnl(row.pnlPct)}">${fmt(row.pnlPct, 2)}%</td>
@@ -2069,6 +2070,7 @@ HTML = """<!doctype html>
                 <th>开仓价</th>
                 <th>现价</th>
                 <th>开仓 U</th>
+                <th>保证金 U</th>
                 <th>当前价值 U</th>
                 <th>浮盈亏</th>
                 <th>收益率</th>
