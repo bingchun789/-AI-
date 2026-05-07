@@ -64,6 +64,29 @@ def normalize_asset(raw_asset: str, base_asset: str | None) -> str:
     return raw_asset
 
 
+DEFAULT_MAINSTREAM_ASSETS = ("BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "TON", "AVAX", "SUI")
+
+
+def normalize_asset_symbol(raw_asset: str) -> str:
+    value = str(raw_asset or "").strip().upper()
+    for suffix in ("USDT", "USDC", "BUSD", "FDUSD"):
+        if value.endswith(suffix) and len(value) > len(suffix):
+            return value[: -len(suffix)]
+    return value
+
+
+def normalize_asset_list(raw_value: str) -> tuple[str, ...]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for chunk in str(raw_value or "").replace("，", ",").split(","):
+        asset = normalize_asset_symbol(chunk)
+        if not asset or asset in seen:
+            continue
+        seen.add(asset)
+        items.append(asset)
+    return tuple(items)
+
+
 def http_request_json(
     url: str,
     *,
@@ -119,6 +142,11 @@ class BotConfig:
     enable_signal_count_entry_gate: bool
     min_long_signal_count_to_open: int
     min_short_signal_count_to_open: int
+    mainstream_assets: tuple[str, ...]
+    min_mainstream_long_signal_count_to_open: int
+    min_smallcap_long_signal_count_to_open: int
+    min_mainstream_short_signal_count_to_open: int
+    min_smallcap_short_signal_count_to_open: int
     enable_signal_imbalance_filter: bool
     signal_imbalance_min_count: int
     signal_imbalance_ratio: float
@@ -161,6 +189,10 @@ class BotConfig:
     enable_signal_count_exit: bool
     long_signal_count_to_close_below: int
     short_signal_count_to_close_below: int
+    mainstream_long_signal_count_to_close_below: int
+    smallcap_long_signal_count_to_close_below: int
+    mainstream_short_signal_count_to_close_below: int
+    smallcap_short_signal_count_to_close_below: int
     enable_post_entry_weak_exit: bool
     long_weak_exit_start_minutes: int
     long_weak_exit_end_minutes: int
@@ -1854,11 +1886,50 @@ def signal_count_entry_threshold_for_side(config: BotConfig, side: str) -> int:
     )
 
 
+def is_mainstream_asset(config: BotConfig, asset: str) -> bool:
+    normalized = normalize_asset_symbol(asset)
+    return normalized in set(config.mainstream_assets)
+
+
+def signal_count_asset_group(config: BotConfig, asset: str) -> str:
+    return "mainstream" if is_mainstream_asset(config, asset) else "smallcap"
+
+
+def signal_count_entry_threshold_for_asset(config: BotConfig, side: str, asset: str) -> int:
+    group = signal_count_asset_group(config, asset)
+    if side == LONG:
+        return (
+            int(config.min_mainstream_long_signal_count_to_open)
+            if group == "mainstream"
+            else int(config.min_smallcap_long_signal_count_to_open)
+        )
+    return (
+        int(config.min_mainstream_short_signal_count_to_open)
+        if group == "mainstream"
+        else int(config.min_smallcap_short_signal_count_to_open)
+    )
+
+
 def signal_count_exit_threshold_for_side(config: BotConfig, side: str) -> int:
     return (
         int(config.long_signal_count_to_close_below)
         if side == LONG
         else int(config.short_signal_count_to_close_below)
+    )
+
+
+def signal_count_exit_threshold_for_asset(config: BotConfig, side: str, asset: str) -> int:
+    group = signal_count_asset_group(config, asset)
+    if side == LONG:
+        return (
+            int(config.mainstream_long_signal_count_to_close_below)
+            if group == "mainstream"
+            else int(config.smallcap_long_signal_count_to_close_below)
+        )
+    return (
+        int(config.mainstream_short_signal_count_to_close_below)
+        if group == "mainstream"
+        else int(config.smallcap_short_signal_count_to_close_below)
     )
 
 
@@ -1870,11 +1941,17 @@ def update_signal_count_action_confirmation(
     triggered: bool,
     current_count: int,
     threshold: int,
+    scope: str = "default",
 ) -> int:
     confirmations = state.setdefault("signalCountActionConfirmations", {})
     side_state = confirmations.setdefault(side, {})
     key = "entry" if action == "entry" else "exit"
-    record = side_state.setdefault(key, {})
+    scoped_state = side_state.setdefault(key, {})
+    if "rounds" in scoped_state:
+        legacy_record = dict(scoped_state)
+        scoped_state.clear()
+        scoped_state["default"] = legacy_record
+    record = scoped_state.setdefault(scope or "default", {})
     if not triggered:
         record.clear()
         record.update(
@@ -2185,26 +2262,39 @@ def clamp_decimal(
     return value
 
 
+def resolve_stop_loss_roi_pct(
+    stop_loss_pct: Decimal, leverage: Decimal | None
+) -> Decimal | None:
+    if stop_loss_pct <= Decimal("0"):
+        return None
+    if leverage is None or leverage <= Decimal("0"):
+        return None
+    return stop_loss_pct * leverage
+
+
 def estimate_position_max_loss_usdt(
     position: dict[str, Any], stop_loss_pct: Decimal
 ) -> Decimal | None:
-    return_basis = infer_return_basis_usdt(position)
-    if return_basis is None or stop_loss_pct <= Decimal("0"):
+    if stop_loss_pct <= Decimal("0"):
         return None
-    return (return_basis * stop_loss_pct) / Decimal("100")
+    notional = decimal_or_none(position.get("notionalUsdt"))
+    if notional is not None and notional != Decimal("0"):
+        return (abs(notional) * stop_loss_pct) / Decimal("100")
+
+    quantity = infer_position_quantity(position)
+    entry_price = decimal_or_none(position.get("entryPrice"))
+    if quantity is None or quantity == Decimal("0") or entry_price is None:
+        return None
+    return (abs(quantity * entry_price) * stop_loss_pct) / Decimal("100")
 
 
 def estimate_entry_max_loss_usdt(config: BotConfig, notional_usdt: Decimal) -> Decimal | None:
     if notional_usdt <= Decimal("0"):
         return None
-    leverage = Decimal(str(config.leverage))
-    if leverage <= Decimal("0"):
-        return None
-    margin_basis = notional_usdt / leverage
     stop_loss_pct = Decimal(str(config.stop_loss_pct))
     if stop_loss_pct <= Decimal("0"):
         return None
-    return (margin_basis * stop_loss_pct) / Decimal("100")
+    return (notional_usdt * stop_loss_pct) / Decimal("100")
 
 
 def calculate_open_risk_summary(
@@ -2249,18 +2339,15 @@ def resolve_entry_notional_usdt(
         return result
 
     stop_loss_pct = Decimal(str(config.stop_loss_pct))
-    leverage = Decimal(str(config.leverage))
     risk_per_trade_pct = Decimal(str(config.risk_per_trade_pct))
     if (
         stop_loss_pct <= Decimal("0")
-        or leverage <= Decimal("0")
         or risk_per_trade_pct <= Decimal("0")
     ):
         return result
 
     risk_budget = (account_equity * risk_per_trade_pct) / Decimal("100")
-    margin_budget = (risk_budget * Decimal("100")) / stop_loss_pct
-    notional = margin_budget * leverage
+    notional = (risk_budget * Decimal("100")) / stop_loss_pct
     notional = clamp_decimal(
         notional,
         min_value=Decimal(str(config.min_notional_per_trade_usdt)),
@@ -2480,14 +2567,11 @@ def calculate_stop_loss_price(
 ) -> Decimal | None:
     if stop_loss_pct <= Decimal("0"):
         return None
-    quantity = infer_position_quantity(position)
     entry_price = decimal_or_none(position.get("entryPrice"))
-    return_basis = infer_return_basis_usdt(position)
-    if quantity is None or quantity == Decimal("0") or entry_price is None or return_basis is None:
+    if entry_price is None or entry_price <= Decimal("0"):
         return None
 
-    max_loss_usdt = (return_basis * stop_loss_pct) / Decimal("100")
-    price_delta = max_loss_usdt / quantity
+    price_delta = entry_price * stop_loss_pct / Decimal("100")
     if side_from_position(position) == SHORT:
         stop_price = entry_price + price_delta
     else:
@@ -2506,7 +2590,14 @@ def should_trigger_stop_loss(
         return False
     if current_pnl_pct is None:
         return False
-    return current_pnl_pct <= -Decimal(str(config.stop_loss_pct))
+    leverage = Decimal(str(config.leverage))
+    stop_loss_roi_pct = resolve_stop_loss_roi_pct(
+        Decimal(str(config.stop_loss_pct)),
+        leverage,
+    )
+    if stop_loss_roi_pct is None:
+        return False
+    return current_pnl_pct <= -stop_loss_roi_pct
 
 
 def parse_profit_lock_tiers(raw_value: str) -> list[tuple[Decimal, Decimal]]:
@@ -2812,6 +2903,13 @@ def enrich_entry_audit_with_stop_loss(
     enriched = dict(audit)
     enriched["stopLossEnabled"] = bool(config.enable_stop_loss)
     enriched["stopLossPct"] = format_decimal_value(config.stop_loss_pct)
+    enriched["stopLossPricePct"] = format_decimal_value(config.stop_loss_pct)
+    enriched["stopLossRoiPct"] = format_decimal_value(
+        resolve_stop_loss_roi_pct(
+            Decimal(str(config.stop_loss_pct)),
+            Decimal(str(config.leverage)),
+        )
+    )
     if not config.enable_stop_loss:
         enriched["stopLossConfigured"] = None
         enriched["stopLossStatus"] = "disabled"
@@ -2838,6 +2936,13 @@ def update_position_stop_loss_state(
 ) -> None:
     position["stopLossEnabled"] = bool(config.enable_stop_loss)
     position["stopLossPct"] = format_decimal_value(config.stop_loss_pct)
+    position["stopLossPricePct"] = format_decimal_value(config.stop_loss_pct)
+    position["stopLossRoiPct"] = format_decimal_value(
+        resolve_stop_loss_roi_pct(
+            Decimal(str(config.stop_loss_pct)),
+            Decimal(str(config.leverage)),
+        )
+    )
     if not config.enable_stop_loss:
         position["stopLossConfigured"] = None
         position["stopLossStatus"] = "disabled"
@@ -2960,6 +3065,7 @@ def build_entry_audit_record(
     *,
     config: BotConfig,
     state: dict[str, Any],
+    asset: str,
     side: str,
     candidate_count: int,
     opposite_candidate_count: int,
@@ -2982,7 +3088,8 @@ def build_entry_audit_record(
     side_limit = config.max_long_open_positions if side == LONG else config.max_short_open_positions
     estimated_entry_risk = sizing_result.get("estimatedRiskUsdt")
     side_open_risk = risk_summary["longRiskUsdt"] if side == LONG else risk_summary["shortRiskUsdt"]
-    signal_count_entry_threshold = signal_count_entry_threshold_for_side(config, side)
+    signal_count_entry_threshold = signal_count_entry_threshold_for_asset(config, side, asset)
+    signal_count_entry_asset_group = signal_count_asset_group(config, asset)
     return {
         "version": 1,
         "candidateCount": candidate_count,
@@ -2991,6 +3098,8 @@ def build_entry_audit_record(
         "minSignalThreshold": int(config.min_signal_count_to_open),
         "signalCountEntryGateEnabled": bool(config.enable_signal_count_entry_gate),
         "signalCountEntryThreshold": signal_count_entry_threshold,
+        "signalCountEntryAssetGroup": signal_count_entry_asset_group,
+        "mainstreamAssets": list(config.mainstream_assets),
         "signalCountEntryPassed": (
             not config.enable_signal_count_entry_gate
             or candidate_count >= signal_count_entry_threshold
@@ -3051,6 +3160,13 @@ def build_entry_audit_record(
         "totalOpenPositions": count_total_open_positions(state),
         "stopLossEnabled": bool(config.enable_stop_loss),
         "stopLossPct": format_decimal_value(config.stop_loss_pct),
+        "stopLossPricePct": format_decimal_value(config.stop_loss_pct),
+        "stopLossRoiPct": format_decimal_value(
+            resolve_stop_loss_roi_pct(
+                Decimal(str(config.stop_loss_pct)),
+                Decimal(str(config.leverage)),
+            )
+        ),
         "stopLossConfigured": None,
         "stopLossStatus": None,
         "stopLossPrice": None,
@@ -3117,6 +3233,13 @@ def build_exit_audit_record(
         "profitProtectionTrailPct": format_decimal_value(config.profit_protection_trail_pct),
         "stopLossEnabled": bool(config.enable_stop_loss),
         "stopLossPct": format_decimal_value(config.stop_loss_pct),
+        "stopLossPricePct": format_decimal_value(config.stop_loss_pct),
+        "stopLossRoiPct": format_decimal_value(
+            resolve_stop_loss_roi_pct(
+                Decimal(str(config.stop_loss_pct)),
+                decimal_or_none(position.get("leverage")) or Decimal(str(config.leverage)),
+            )
+        ),
         "stopLossConfigured": position.get("stopLossConfigured"),
         "configuredStopLossPrice": position.get("stopLossPrice"),
         "stopLossStatus": position.get("stopLossStatus"),
@@ -3955,8 +4078,33 @@ def process_strategy(
 
     fee_rate = Decimal(str(config.estimated_taker_fee_rate))
     candidate_count = len(candidates)
-    entry_signal_count_threshold = signal_count_entry_threshold_for_side(config, side)
-    exit_signal_count_threshold = signal_count_exit_threshold_for_side(config, side)
+    entry_confirmation_rounds_by_group: dict[str, int] = {}
+    for entry_group, entry_threshold in {
+        "mainstream": (
+            int(config.min_mainstream_long_signal_count_to_open)
+            if side == LONG
+            else int(config.min_mainstream_short_signal_count_to_open)
+        ),
+        "smallcap": (
+            int(config.min_smallcap_long_signal_count_to_open)
+            if side == LONG
+            else int(config.min_smallcap_short_signal_count_to_open)
+        ),
+    }.items():
+        entry_confirmation_rounds_by_group[entry_group] = update_signal_count_action_confirmation(
+            state=state,
+            side=side,
+            action="entry",
+            triggered=(
+                bool(config.enable_signal_count_entry_gate)
+                and not block_new_entries
+                and not freeze_signal_decisions
+                and candidate_count >= entry_threshold
+            ),
+            current_count=candidate_count,
+            threshold=entry_threshold,
+            scope=entry_group,
+        )
     candidate_assets = {
         normalize_asset(item.get("asset", ""), item.get("baseAsset")) for item in candidates
     }
@@ -3999,32 +4147,37 @@ def process_strategy(
         for key, position in state.get("positions", {}).items()
         if side_from_position(position) == side and position.get("strategyId") == strategy_id
     }
-    entry_confirmation_rounds = update_signal_count_action_confirmation(
-        state=state,
-        side=side,
-        action="entry",
-        triggered=(
-            bool(config.enable_signal_count_entry_gate)
-            and not block_new_entries
-            and not freeze_signal_decisions
-            and candidate_count >= entry_signal_count_threshold
+    exit_confirmation_rounds_by_group: dict[str, int] = {}
+    for exit_group, exit_threshold in {
+        "mainstream": (
+            int(config.mainstream_long_signal_count_to_close_below)
+            if side == LONG
+            else int(config.mainstream_short_signal_count_to_close_below)
         ),
-        current_count=candidate_count,
-        threshold=entry_signal_count_threshold,
-    )
-    exit_confirmation_rounds = update_signal_count_action_confirmation(
-        state=state,
-        side=side,
-        action="exit",
-        triggered=(
-            bool(config.enable_signal_count_exit)
-            and not freeze_signal_decisions
-            and bool(current_positions)
-            and candidate_count < exit_signal_count_threshold
+        "smallcap": (
+            int(config.smallcap_long_signal_count_to_close_below)
+            if side == LONG
+            else int(config.smallcap_short_signal_count_to_close_below)
         ),
-        current_count=candidate_count,
-        threshold=exit_signal_count_threshold,
-    )
+    }.items():
+        has_group_position = any(
+            signal_count_asset_group(config, str(position.get("asset") or "")) == exit_group
+            for position in current_positions.values()
+        )
+        exit_confirmation_rounds_by_group[exit_group] = update_signal_count_action_confirmation(
+            state=state,
+            side=side,
+            action="exit",
+            triggered=(
+                bool(config.enable_signal_count_exit)
+                and not freeze_signal_decisions
+                and has_group_position
+                and candidate_count < exit_threshold
+            ),
+            current_count=candidate_count,
+            threshold=exit_threshold,
+            scope=exit_group,
+        )
 
     for key, position in list(current_positions.items()):
         if config.dry_run or broker.name != "binance_testnet":
@@ -4678,8 +4831,21 @@ def process_strategy(
             continue
         if (
             config.enable_signal_count_exit
+            and (exit_signal_count_threshold := signal_count_exit_threshold_for_asset(
+                config,
+                side,
+                str(position.get("asset") or ""),
+            ))
             and candidate_count < exit_signal_count_threshold
         ):
+            exit_signal_count_group = signal_count_asset_group(
+                config,
+                str(position.get("asset") or ""),
+            )
+            exit_confirmation_rounds = exit_confirmation_rounds_by_group.get(
+                exit_signal_count_group,
+                0,
+            )
             if exit_confirmation_rounds < SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS:
                 position["signalLostRounds"] = 0
                 decisions.append(
@@ -4695,6 +4861,7 @@ def process_strategy(
                         ),
                         "currentSignalCount": candidate_count,
                         "exitSignalCountThreshold": exit_signal_count_threshold,
+                        "signalCountExitAssetGroup": exit_signal_count_group,
                         "confirmationRounds": exit_confirmation_rounds,
                         "confirmationRequiredRounds": SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS,
                     }
@@ -4708,6 +4875,7 @@ def process_strategy(
             )
             exit_audit["currentSignalCount"] = candidate_count
             exit_audit["exitSignalCountThreshold"] = exit_signal_count_threshold
+            exit_audit["signalCountExitAssetGroup"] = exit_signal_count_group
             exit_audit["confirmationRounds"] = exit_confirmation_rounds
             exit_audit["confirmationRequiredRounds"] = SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS
             close_result = broker.close_position(
@@ -4753,6 +4921,7 @@ def process_strategy(
                     ),
                     "currentSignalCount": candidate_count,
                     "exitSignalCountThreshold": exit_signal_count_threshold,
+                    "signalCountExitAssetGroup": exit_signal_count_group,
                     "realizedPnlUsdt": exit_event["realizedPnlUsdt"],
                     "netRealizedPnlUsdt": exit_event["netRealizedPnlUsdt"],
                     "closeSide": exit_event["closeSide"],
@@ -4877,6 +5046,12 @@ def process_strategy(
 
     for item in candidates:
         asset = normalize_asset(item.get("asset", ""), item.get("baseAsset"))
+        entry_signal_count_threshold = signal_count_entry_threshold_for_asset(config, side, asset)
+        entry_signal_count_group = signal_count_asset_group(config, asset)
+        entry_confirmation_rounds = entry_confirmation_rounds_by_group.get(
+            entry_signal_count_group,
+            0,
+        )
         if block_new_entries:
             decisions.append(
                 {
@@ -4886,6 +5061,8 @@ def process_strategy(
                     "reason": block_new_entries_reason or "signal_source_unstable",
                     "currentSignalCount": candidate_count,
                     "oppositeSignalCount": opposite_candidate_count,
+                    "signalCountEntryAssetGroup": entry_signal_count_group,
+                    "requiredSignalCount": entry_signal_count_threshold,
                     "signalSource": signal_source,
                     "signalFetchIssues": signal_fetch_issues or [],
                 }
@@ -4975,6 +5152,7 @@ def process_strategy(
                     ),
                     "currentSignalCount": candidate_count,
                     "requiredSignalCount": entry_signal_count_threshold,
+                    "signalCountEntryAssetGroup": entry_signal_count_group,
                 }
             )
             continue
@@ -4996,6 +5174,7 @@ def process_strategy(
                     ),
                     "currentSignalCount": candidate_count,
                     "requiredSignalCount": entry_signal_count_threshold,
+                    "signalCountEntryAssetGroup": entry_signal_count_group,
                     "confirmationRounds": entry_confirmation_rounds,
                     "confirmationRequiredRounds": SIGNAL_COUNT_ACTION_CONFIRM_ROUNDS,
                 }
@@ -5314,6 +5493,7 @@ def process_strategy(
         entry_audit = build_entry_audit_record(
             config=config,
             state=state,
+            asset=asset,
             side=side,
             candidate_count=candidate_count,
             opposite_candidate_count=opposite_candidate_count,
@@ -5837,6 +6017,33 @@ def build_config(workdir: Path) -> BotConfig:
         enable_signal_count_entry_gate=get_env_bool("ENABLE_SIGNAL_COUNT_ENTRY_GATE", False),
         min_long_signal_count_to_open=int(os.getenv("MIN_LONG_SIGNAL_COUNT_TO_OPEN", "13")),
         min_short_signal_count_to_open=int(os.getenv("MIN_SHORT_SIGNAL_COUNT_TO_OPEN", "20")),
+        mainstream_assets=normalize_asset_list(
+            os.getenv("MAINSTREAM_ASSETS", ",".join(DEFAULT_MAINSTREAM_ASSETS))
+        ),
+        min_mainstream_long_signal_count_to_open=int(
+            os.getenv(
+                "MIN_MAINSTREAM_LONG_SIGNAL_COUNT_TO_OPEN",
+                os.getenv("MIN_LONG_SIGNAL_COUNT_TO_OPEN", "13"),
+            )
+        ),
+        min_smallcap_long_signal_count_to_open=int(
+            os.getenv(
+                "MIN_SMALLCAP_LONG_SIGNAL_COUNT_TO_OPEN",
+                os.getenv("MIN_LONG_SIGNAL_COUNT_TO_OPEN", "13"),
+            )
+        ),
+        min_mainstream_short_signal_count_to_open=int(
+            os.getenv(
+                "MIN_MAINSTREAM_SHORT_SIGNAL_COUNT_TO_OPEN",
+                os.getenv("MIN_SHORT_SIGNAL_COUNT_TO_OPEN", "20"),
+            )
+        ),
+        min_smallcap_short_signal_count_to_open=int(
+            os.getenv(
+                "MIN_SMALLCAP_SHORT_SIGNAL_COUNT_TO_OPEN",
+                os.getenv("MIN_SHORT_SIGNAL_COUNT_TO_OPEN", "20"),
+            )
+        ),
         enable_signal_imbalance_filter=get_env_bool("ENABLE_SIGNAL_IMBALANCE_FILTER", True),
         signal_imbalance_min_count=int(
             os.getenv(
@@ -5876,7 +6083,7 @@ def build_config(workdir: Path) -> BotConfig:
         max_hold_hours=int(os.getenv("MAX_HOLD_HOURS", "48")),
         time_exit_min_pnl_pct=float(os.getenv("TIME_EXIT_MIN_PNL_PCT", "5")),
         enable_stop_loss=get_env_bool("ENABLE_STOP_LOSS", True),
-        stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "32")),
+        stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "6.4")),
         enable_profit_lock=get_env_bool("ENABLE_PROFIT_LOCK", True),
         profit_lock_tiers=os.getenv("PROFIT_LOCK_TIERS", "4:2,8:5,12:8"),
         enable_profit_protection=get_env_bool("ENABLE_PROFIT_PROTECTION", True),
@@ -5901,6 +6108,30 @@ def build_config(workdir: Path) -> BotConfig:
         ),
         short_signal_count_to_close_below=int(
             os.getenv("SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW", "19")
+        ),
+        mainstream_long_signal_count_to_close_below=int(
+            os.getenv(
+                "MAINSTREAM_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+                os.getenv("LONG_SIGNAL_COUNT_TO_CLOSE_BELOW", "11"),
+            )
+        ),
+        smallcap_long_signal_count_to_close_below=int(
+            os.getenv(
+                "SMALLCAP_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+                os.getenv("LONG_SIGNAL_COUNT_TO_CLOSE_BELOW", "11"),
+            )
+        ),
+        mainstream_short_signal_count_to_close_below=int(
+            os.getenv(
+                "MAINSTREAM_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
+                os.getenv("SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW", "19"),
+            )
+        ),
+        smallcap_short_signal_count_to_close_below=int(
+            os.getenv(
+                "SMALLCAP_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
+                os.getenv("SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW", "19"),
+            )
         ),
         enable_post_entry_weak_exit=get_env_bool("ENABLE_POST_ENTRY_WEAK_EXIT", False),
         long_weak_exit_start_minutes=int(

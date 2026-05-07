@@ -606,7 +606,10 @@ def _build_rule_summary(config: Any) -> list[dict[str, str]]:
         },
         {
             "title": "硬止损",
-            "value": f"开仓后立即挂 {config.stop_loss_pct:.0f}% 止损单"
+            "value": (
+                f"开仓后按价格反向 {config.stop_loss_pct:g}% 挂止损单，"
+                f"按 {config.leverage}x 约等于收益率 -{float(config.stop_loss_pct) * float(config.leverage):.1f}%"
+            )
             if config.enable_stop_loss
             else "已关闭",
         },
@@ -631,6 +634,7 @@ def _build_rule_summary(config: Any) -> list[dict[str, str]]:
 
 def _build_config_toggles(config: Any) -> list[dict[str, Any]]:
     fallback_intervals = "/".join(config.trend_fallback_intervals) or "-"
+    stop_loss_roi_pct = float(config.stop_loss_pct) * float(config.leverage)
     return [
         {
             "key": "DRY_RUN",
@@ -700,18 +704,18 @@ def _build_config_toggles(config: Any) -> list[dict[str, Any]]:
             "key": "ENABLE_STOP_LOSS",
             "label": "硬止损",
             "enabled": config.enable_stop_loss,
-            "detail": f"开仓后立即挂 {config.stop_loss_pct}% 硬止损单。",
+            "detail": f"开仓后按价格反向 {config.stop_loss_pct}% 挂硬止损；按 {config.leverage}x 约等于收益率 -{stop_loss_roi_pct:.1f}%。",
         },
         {
             "key": "STOP_LOSS_PCT",
-            "label": "\u786c\u6b62\u635f\u6bd4\u4f8b",
+            "label": "\u786c\u6b62\u635f\u4ef7\u683c\u6bd4\u4f8b",
             "type": "number",
             "value": float(config.stop_loss_pct),
             "min": 0,
             "step": 0.1,
             "unit": "%",
             "showWhen": {"key": "ENABLE_STOP_LOSS"},
-            "detail": "\u5f00\u542f\u786c\u6b62\u635f\u540e\uff0c\u6309\u8fd9\u4e2a\u6bd4\u4f8b\u8bbe\u7f6e\u786c\u6b62\u635f\u3002",
+            "detail": f"\u8fd9\u91cc\u586b\u4ef7\u683c\u53cd\u5411\u767e\u5206\u6bd4\uff0c\u4e0d\u7528\u624b\u52a8\u4e58\u6760\u6746\uff1b\u7cfb\u7edf\u4f1a\u6309 {config.leverage}x \u81ea\u52a8\u6362\u7b97\uff0c\u5f53\u524d\u7ea6\u7b49\u4e8e\u6536\u76ca\u7387 -{stop_loss_roi_pct:.1f}%\u3002",
         },
         {
             "key": "ENABLE_PROFIT_LOCK",
@@ -800,8 +804,8 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
     entry_gate_rule = {
         "title": "榜单数量开仓",
         "value": (
-            f"做多达到 {config.min_long_signal_count_to_open} 个才开多；"
-            f"做空达到 {config.min_short_signal_count_to_open} 个才开空；"
+            f"主流币做多达到 {config.min_mainstream_long_signal_count_to_open} 个，小市值做多达到 {config.min_smallcap_long_signal_count_to_open} 个；"
+            f"主流币做空达到 {config.min_mainstream_short_signal_count_to_open} 个，小市值做空达到 {config.min_smallcap_short_signal_count_to_open} 个；"
             "达到门槛后连续确认 3 轮才执行"
             if config.enable_signal_count_entry_gate
             else "已关闭"
@@ -820,8 +824,8 @@ def _augment_rule_summary(items: list[dict[str, str]], config: Any) -> list[dict
     exit_gate_rule = {
         "title": "榜单数量平仓",
         "value": (
-            f"做多少于 {config.long_signal_count_to_close_below} 个平全部做多仓；"
-            f"做空少于 {config.short_signal_count_to_close_below} 个平全部做空仓；"
+            f"主流币做多少于 {config.mainstream_long_signal_count_to_close_below} 个，小市值做多少于 {config.smallcap_long_signal_count_to_close_below} 个；"
+            f"主流币做空少于 {config.mainstream_short_signal_count_to_close_below} 个，小市值做空少于 {config.smallcap_short_signal_count_to_close_below} 个；"
             "跌破门槛后连续确认 3 轮才执行"
             if config.enable_signal_count_exit
             else "已关闭"
@@ -911,29 +915,122 @@ def _augment_config_toggles(items: list[dict[str, Any]], config: Any) -> list[di
             "key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE",
             "label": "榜单数量开仓",
             "enabled": config.enable_signal_count_entry_gate,
-            "detail": "按强烈看多、强烈看空的列表数量，分别控制做多和做空方向是否允许开新仓。",
+            "detail": "按强烈看多、强烈看空的列表数量控制开仓，并且主流币和小市值币使用不同门槛。",
         },
         {
-            "key": "MIN_LONG_SIGNAL_COUNT_TO_OPEN",
-            "label": "做多开仓最少个数",
-            "type": "number",
-            "value": int(config.min_long_signal_count_to_open),
-            "min": 0,
-            "step": 1,
-            "unit": "个",
-            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE"},
-            "detail": "当前强烈看多个数达到这个值后，才允许做多方向开新仓。",
+            "key": "ENABLE_SIGNAL_COUNT_EXIT",
+            "label": "榜单数量平仓",
+            "enabled": config.enable_signal_count_exit,
+            "detail": "开启后，当前榜单数量跌破对应平仓门槛时，连续确认 3 轮后平掉对应分组持仓。",
         },
         {
-            "key": "MIN_SHORT_SIGNAL_COUNT_TO_OPEN",
-            "label": "做空开仓最少个数",
-            "type": "number",
-            "value": int(config.min_short_signal_count_to_open),
-            "min": 0,
-            "step": 1,
-            "unit": "个",
+            "key": "MAINSTREAM_LONG_SIGNAL_COUNT_GATE_PAIR",
+            "label": "主流币做多门槛",
+            "type": "pair",
+            "fields": [
+                {
+                    "key": "MIN_MAINSTREAM_LONG_SIGNAL_COUNT_TO_OPEN",
+                    "label": "开仓门槛",
+                    "value": int(config.min_mainstream_long_signal_count_to_open),
+                    "min": 0,
+                    "step": 1,
+                    "unit": "个",
+                },
+                {
+                    "key": "MAINSTREAM_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+                    "label": "平仓门槛",
+                    "value": int(config.mainstream_long_signal_count_to_close_below),
+                    "min": 0,
+                    "step": 1,
+                    "unit": "个",
+                },
+            ],
             "showWhen": {"key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE"},
-            "detail": "当前强烈看空个数达到这个值后，才允许做空方向开新仓。",
+            "detail": "主流币做多：达到开仓门槛才开多；低于平仓门槛时按榜单数量平仓。",
+        },
+        {
+            "key": "SMALLCAP_LONG_SIGNAL_COUNT_GATE_PAIR",
+            "label": "小市值币做多门槛",
+            "type": "pair",
+            "fields": [
+                {
+                    "key": "MIN_SMALLCAP_LONG_SIGNAL_COUNT_TO_OPEN",
+                    "label": "开仓门槛",
+                    "value": int(config.min_smallcap_long_signal_count_to_open),
+                    "min": 0,
+                    "step": 1,
+                    "unit": "个",
+                },
+                {
+                    "key": "SMALLCAP_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+                    "label": "平仓门槛",
+                    "value": int(config.smallcap_long_signal_count_to_close_below),
+                    "min": 0,
+                    "step": 1,
+                    "unit": "个",
+                },
+            ],
+            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE"},
+            "detail": "小市值币做多：达到开仓门槛才开多；低于平仓门槛时按榜单数量平仓。",
+        },
+        {
+            "key": "MAINSTREAM_SHORT_SIGNAL_COUNT_GATE_PAIR",
+            "label": "主流币做空门槛",
+            "type": "pair",
+            "fields": [
+                {
+                    "key": "MIN_MAINSTREAM_SHORT_SIGNAL_COUNT_TO_OPEN",
+                    "label": "开仓门槛",
+                    "value": int(config.min_mainstream_short_signal_count_to_open),
+                    "min": 0,
+                    "step": 1,
+                    "unit": "个",
+                },
+                {
+                    "key": "MAINSTREAM_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
+                    "label": "平仓门槛",
+                    "value": int(config.mainstream_short_signal_count_to_close_below),
+                    "min": 0,
+                    "step": 1,
+                    "unit": "个",
+                },
+            ],
+            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE"},
+            "detail": "主流币做空：达到开仓门槛才开空；低于平仓门槛时按榜单数量平仓。",
+        },
+        {
+            "key": "SMALLCAP_SHORT_SIGNAL_COUNT_GATE_PAIR",
+            "label": "小市值币做空门槛",
+            "type": "pair",
+            "fields": [
+                {
+                    "key": "MIN_SMALLCAP_SHORT_SIGNAL_COUNT_TO_OPEN",
+                    "label": "开仓门槛",
+                    "value": int(config.min_smallcap_short_signal_count_to_open),
+                    "min": 0,
+                    "step": 1,
+                    "unit": "个",
+                },
+                {
+                    "key": "SMALLCAP_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
+                    "label": "平仓门槛",
+                    "value": int(config.smallcap_short_signal_count_to_close_below),
+                    "min": 0,
+                    "step": 1,
+                    "unit": "个",
+                },
+            ],
+            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE"},
+            "detail": "小市值币做空：达到开仓门槛才开空；低于平仓门槛时按榜单数量平仓。",
+        },
+        {
+            "key": "MAINSTREAM_ASSETS",
+            "label": "主流币名单",
+            "type": "text",
+            "value": ",".join(config.mainstream_assets),
+            "unit": "",
+            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_ENTRY_GATE"},
+            "detail": "用英文逗号分隔。名单内按主流币门槛，其余币按小市值币门槛。",
         },
     ]
     imbalance_controls = [
@@ -1174,36 +1271,7 @@ def _augment_config_toggles(items: list[dict[str, Any]], config: Any) -> list[di
             "detail": "例如 0.5 表示先平掉一半仓位。",
         },
     ]
-    exit_gate_controls = [
-        {
-            "key": "ENABLE_SIGNAL_COUNT_EXIT",
-            "label": "榜单数量平仓",
-            "enabled": config.enable_signal_count_exit,
-            "detail": "当当前强烈看多或强烈看空的列表数量跌破阈值时，按方向平掉全部策略仓位。",
-        },
-        {
-            "key": "LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
-            "label": "做多少于此个数平仓",
-            "type": "number",
-            "value": int(config.long_signal_count_to_close_below),
-            "min": 0,
-            "step": 1,
-            "unit": "个",
-            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_EXIT"},
-            "detail": "当前强烈看多个数低于这个值时，平掉全部做多策略仓位。",
-        },
-        {
-            "key": "SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
-            "label": "做空少于此个数平仓",
-            "type": "number",
-            "value": int(config.short_signal_count_to_close_below),
-            "min": 0,
-            "step": 1,
-            "unit": "个",
-            "showWhen": {"key": "ENABLE_SIGNAL_COUNT_EXIT"},
-            "detail": "当前强烈看空个数低于这个值时，平掉全部做空策略仓位。",
-        },
-    ]
+    exit_gate_controls: list[dict[str, Any]] = []
     post_entry_weak_exit_controls = [
         {
             "key": "ENABLE_POST_ENTRY_WEAK_EXIT",
@@ -2772,6 +2840,98 @@ def _build_attribution_stats(
     }
 
 
+def _build_stop_loss_leaderboard(closed_history: list[dict[str, Any]]) -> dict[str, Any]:
+    by_asset: dict[str, dict[str, Any]] = {}
+    stop_loss_events = 0
+    long_stop_events = 0
+    short_stop_events = 0
+
+    for event in closed_history:
+        reason = str(event.get("reason") or "").lower()
+        stop_loss_mode = str(event.get("stopLossMode") or "").lower()
+        if reason != "stop_loss" or stop_loss_mode == "breakeven":
+            continue
+        stop_loss_events += 1
+        side = event.get("side", LONG)
+        if side == SHORT:
+            short_stop_events += 1
+        else:
+            long_stop_events += 1
+
+        net_pnl = _event_net_pnl(event)
+        return_pct = _event_return_pct(event, net_pnl)
+        asset_key = event.get("contractSymbol") or event.get("asset") or "-"
+        row = by_asset.setdefault(
+            str(asset_key),
+            {
+                **_make_attribution_bucket(),
+                "longStopCount": 0,
+                "shortStopCount": 0,
+                "latestTimestamp": 0,
+            },
+        )
+        row["label"] = str(asset_key)
+        row["tradeCount"] += 1
+        if net_pnl is not None:
+            if net_pnl > 0:
+                row["winCount"] += 1
+            elif net_pnl < 0:
+                row["lossCount"] += 1
+            row["netRealizedPnlUsdt"] += net_pnl
+        if return_pct is not None:
+            row["_returnValues"].append(return_pct)
+        if side == SHORT:
+            row["shortStopCount"] += 1
+        else:
+            row["longStopCount"] += 1
+        try:
+            row["latestTimestamp"] = max(
+                float(row.get("latestTimestamp") or 0),
+                float(event.get("timestamp") or 0),
+            )
+        except Exception:
+            pass
+
+    rows = _aggregate_attribution_rows(by_asset)
+    latest_by_key = {
+        key: value.get("latestTimestamp", 0)
+        for key, value in by_asset.items()
+    }
+    extra_by_key = {
+        key: {
+            "longStopCount": value.get("longStopCount", 0),
+            "shortStopCount": value.get("shortStopCount", 0),
+        }
+        for key, value in by_asset.items()
+    }
+    for row in rows:
+        extra = extra_by_key.get(str(row.get("key")), {})
+        row["longStopCount"] = int(extra.get("longStopCount", 0) or 0)
+        row["shortStopCount"] = int(extra.get("shortStopCount", 0) or 0)
+        row["stopLossCount"] = int(row.get("tradeCount") or 0)
+        row["latestTimestamp"] = latest_by_key.get(str(row.get("key")), 0)
+    rows.sort(
+        key=lambda item: (
+            -int(item.get("stopLossCount") or 0),
+            Decimal(str(item.get("netRealizedPnlUsdt") or "0")),
+            -float(item.get("latestTimestamp") or 0),
+            item.get("label") or item.get("key") or "",
+        )
+    )
+    for row in rows:
+        row.pop("latestTimestamp", None)
+
+    return {
+        "summary": {
+            "stopLossEventCount": stop_loss_events,
+            "longStopEventCount": long_stop_events,
+            "shortStopEventCount": short_stop_events,
+            "assetCount": len(rows),
+        },
+        "rows": rows[:20],
+    }
+
+
 def _build_trade_history_from_close_events(
     close_events: list[dict[str, Any]],
     realized_events: list[dict[str, Any]] | None = None,
@@ -4197,6 +4357,7 @@ def build_report(workdir: Path, dotenv_file: str = ".env") -> dict[str, Any]:
             all_history,
             current_signal_counts,
         ),
+        "stopLossLeaderboard": _build_stop_loss_leaderboard(history_for_display),
         "accountCircuitBreaker": state.get("riskState", {}).get("accountCircuitBreaker", {}),
         "summary": {
             "openPositions": len(positions),

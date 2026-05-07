@@ -795,7 +795,7 @@ def _entry_audit_toggle_config_mismatches(
         and stop_loss_pct != expected_stop_loss_pct
     ):
         failures.append(
-            f"硬止损阈值记录为 {stop_loss_pct}% ，当前配置应为 {expected_stop_loss_pct}%"
+            f"硬止损价格比例记录为 {stop_loss_pct}% ，当前配置应为 {expected_stop_loss_pct}%"
         )
     return failures
 
@@ -1719,15 +1719,23 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
         )
         breakeven_like_stop = _is_protective_breakeven_stop(event, audit)
         stop_loss_tolerance_pct = Decimal("1.0")
+        leverage = _to_decimal(audit.get("leverage")) or _to_decimal(event.get("leverage"))
+        stop_loss_roi_pct = _to_decimal(audit.get("stopLossRoiPct"))
+        if stop_loss_roi_pct is None and stop_loss_pct is not None:
+            stop_loss_roi_pct = (
+                stop_loss_pct * leverage
+                if leverage is not None and leverage > Decimal("0")
+                else stop_loss_pct
+            )
         if stop_loss_pct is None:
-            failures.append("未记录硬止损阈值")
+            failures.append("未记录硬止损价格比例")
         elif stop_loss_mode == "breakeven" or (
             breakeven_activated and breakeven_like_stop
         ):
             if not breakeven_activated:
                 failures.append("保本止损平仓缺少保本激活时间记录")
-        elif not any(
-            value is not None and value <= -(stop_loss_pct - stop_loss_tolerance_pct)
+        elif stop_loss_roi_pct is not None and not any(
+            value is not None and value <= -(stop_loss_roi_pct - stop_loss_tolerance_pct)
             for value in (
                 current_pnl_pct,
                 exit_pnl_pct,
@@ -1735,8 +1743,13 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
                 realized_pnl_pct,
             )
         ):
+            threshold_detail = format(stop_loss_roi_pct, "f")
+            if leverage is not None and leverage > Decimal("0"):
+                threshold_detail = (
+                    f"{threshold_detail}%（价格反向 {audit.get('stopLossPct') or '-'}% × 杠杆 {format(leverage, 'f')}）"
+                )
             failures.append(
-                f"当前收益 {audit.get('currentPnlPct') or '-'} 未跌破止损阈值 -{audit.get('stopLossPct') or '-'}"
+                f"当前收益 {audit.get('currentPnlPct') or '-'} 未跌破止损阈值 -{threshold_detail}"
             )
         stop_loss_configured = audit.get("stopLossConfigured")
         if stop_loss_configured is None:

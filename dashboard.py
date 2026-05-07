@@ -47,6 +47,15 @@ CONFIG_VALUE_KEYS = {
     "MAX_SHORT_OPEN_POSITIONS",
     "MIN_LONG_SIGNAL_COUNT_TO_OPEN",
     "MIN_SHORT_SIGNAL_COUNT_TO_OPEN",
+    "MIN_MAINSTREAM_LONG_SIGNAL_COUNT_TO_OPEN",
+    "MIN_SMALLCAP_LONG_SIGNAL_COUNT_TO_OPEN",
+    "MIN_MAINSTREAM_SHORT_SIGNAL_COUNT_TO_OPEN",
+    "MIN_SMALLCAP_SHORT_SIGNAL_COUNT_TO_OPEN",
+    "MAINSTREAM_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+    "SMALLCAP_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+    "MAINSTREAM_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
+    "SMALLCAP_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
+    "MAINSTREAM_ASSETS",
     "SIGNAL_IMBALANCE_MIN_COUNT",
     "SIGNAL_IMBALANCE_RATIO",
     "DAILY_LOSS_PAUSE_PCT",
@@ -88,6 +97,14 @@ CONFIG_INTEGER_VALUE_KEYS = {
     "MAX_SHORT_OPEN_POSITIONS",
     "MIN_LONG_SIGNAL_COUNT_TO_OPEN",
     "MIN_SHORT_SIGNAL_COUNT_TO_OPEN",
+    "MIN_MAINSTREAM_LONG_SIGNAL_COUNT_TO_OPEN",
+    "MIN_SMALLCAP_LONG_SIGNAL_COUNT_TO_OPEN",
+    "MIN_MAINSTREAM_SHORT_SIGNAL_COUNT_TO_OPEN",
+    "MIN_SMALLCAP_SHORT_SIGNAL_COUNT_TO_OPEN",
+    "MAINSTREAM_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+    "SMALLCAP_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW",
+    "MAINSTREAM_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
+    "SMALLCAP_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW",
     "SIGNAL_IMBALANCE_MIN_COUNT",
     "MAX_CONSECUTIVE_LOSSES",
     "CIRCUIT_BREAKER_COOLDOWN_MINUTES",
@@ -1003,6 +1020,25 @@ HTML = """<!doctype html>
       gap: 8px;
       min-width: 0;
     }
+    .config-pair-control {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .config-pair-field {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .config-pair-label {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
     .config-number-input {
       width: 96px;
       border: 1px solid rgba(24,32,40,.14);
@@ -1078,6 +1114,7 @@ HTML = """<!doctype html>
       .tab-bar { top: 8px; }
       .toggle-item { align-items: flex-start; flex-wrap: wrap; }
       .config-control { width: 100%; justify-content: flex-start; }
+      .config-pair-control { width: 100%; justify-content: flex-start; }
     }
   </style>
 </head>
@@ -1243,6 +1280,12 @@ HTML = """<!doctype html>
 
       <section class="tab-panel" data-panel="records" role="tabpanel">
         <div class="section-stack">
+          <div class="card">
+            <div class="label">止损榜单</div>
+            <div class="sub" id="stopLossLeaderboardMeta">统计自当前这轮系统数据起，哪些币种被止损次数最多。</div>
+            <div id="stopLossLeaderboardWrap"></div>
+          </div>
+
           <div class="card">
             <div class="label">平仓记录（官方 API）</div>
             <div class="sub" style="margin-bottom:8px">来自币安官方接口，最近 30 天已平仓记录</div>
@@ -3196,7 +3239,7 @@ HTML = """<!doctype html>
         body: 'rgba(184,104,61,.08)',
         card: 'rgba(255,248,243,.86)',
         titleColor: '#7d4423',
-        keys: ['DRY_RUN', 'ENABLE_MIN_SIGNAL_COUNT_FILTER', 'ENABLE_SIGNAL_COUNT_ENTRY_GATE', 'MIN_LONG_SIGNAL_COUNT_TO_OPEN', 'MIN_SHORT_SIGNAL_COUNT_TO_OPEN', 'ENABLE_SIGNAL_IMBALANCE_FILTER', 'SIGNAL_IMBALANCE_MIN_COUNT', 'SIGNAL_IMBALANCE_RATIO', 'COOLDOWN_MINUTES', 'MAX_TOTAL_OPEN_POSITIONS', 'MAX_LONG_OPEN_POSITIONS', 'MAX_SHORT_OPEN_POSITIONS', 'SKIP_IF_MARGIN_MODE_UNAVAILABLE'],
+        keys: ['DRY_RUN', 'ENABLE_MIN_SIGNAL_COUNT_FILTER', 'ENABLE_SIGNAL_COUNT_ENTRY_GATE', 'ENABLE_SIGNAL_COUNT_EXIT', 'MIN_LONG_SIGNAL_COUNT_TO_OPEN', 'MIN_SHORT_SIGNAL_COUNT_TO_OPEN', 'MIN_MAINSTREAM_LONG_SIGNAL_COUNT_TO_OPEN', 'MIN_SMALLCAP_LONG_SIGNAL_COUNT_TO_OPEN', 'MIN_MAINSTREAM_SHORT_SIGNAL_COUNT_TO_OPEN', 'MIN_SMALLCAP_SHORT_SIGNAL_COUNT_TO_OPEN', 'MAINSTREAM_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW', 'SMALLCAP_LONG_SIGNAL_COUNT_TO_CLOSE_BELOW', 'MAINSTREAM_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW', 'SMALLCAP_SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW', 'MAINSTREAM_ASSETS', 'ENABLE_SIGNAL_IMBALANCE_FILTER', 'SIGNAL_IMBALANCE_MIN_COUNT', 'SIGNAL_IMBALANCE_RATIO', 'COOLDOWN_MINUTES', 'MAX_TOTAL_OPEN_POSITIONS', 'MAX_LONG_OPEN_POSITIONS', 'MAX_SHORT_OPEN_POSITIONS', 'SKIP_IF_MARGIN_MODE_UNAVAILABLE'],
         defaultOpen: true,
       },
       {
@@ -3278,9 +3321,6 @@ HTML = """<!doctype html>
         keys: [
           'ENABLE_STOP_LOSS',
           'STOP_LOSS_PCT',
-          'ENABLE_SIGNAL_COUNT_EXIT',
-          'LONG_SIGNAL_COUNT_TO_CLOSE_BELOW',
-          'SHORT_SIGNAL_COUNT_TO_CLOSE_BELOW',
           'ENABLE_POST_ENTRY_WEAK_EXIT',
           'LONG_WEAK_EXIT_START_MINUTES',
           'LONG_WEAK_EXIT_END_MINUTES',
@@ -3332,10 +3372,17 @@ HTML = """<!doctype html>
 
     function configDisplayItem(item) {
       const next = { ...item };
-      if (item.type === 'number' && Object.prototype.hasOwnProperty.call(_configDraftValues, item.key)) {
+      if (item.type === 'pair') {
+        next.fields = (item.fields || []).map(field => (
+          Object.prototype.hasOwnProperty.call(_configDraftValues, field.key)
+            ? { ...field, value: _configDraftValues[field.key] }
+            : field
+        ));
+      }
+      if ((item.type === 'number' || item.type === 'text') && Object.prototype.hasOwnProperty.call(_configDraftValues, item.key)) {
         next.value = _configDraftValues[item.key];
       }
-      if (item.type !== 'number' && Object.prototype.hasOwnProperty.call(_configDraftToggles, item.key)) {
+      if (item.type !== 'number' && item.type !== 'text' && item.type !== 'pair' && Object.prototype.hasOwnProperty.call(_configDraftToggles, item.key)) {
         next.enabled = Boolean(_configDraftToggles[item.key]);
       }
       return next;
@@ -3376,13 +3423,13 @@ HTML = """<!doctype html>
 
     function collectConfigPayload() {
       const inputs = Array.from(document.querySelectorAll('#configToggleWrap input[data-config-key]'));
-      const numberInputs = Array.from(document.querySelectorAll('#configToggleWrap input[data-config-value-key]'));
+      const valueInputs = Array.from(document.querySelectorAll('#configToggleWrap input[data-config-value-key]'));
       const toggles = {};
       const values = {};
       for (const input of inputs) {
         toggles[input.dataset.configKey] = input.checked;
       }
-      for (const input of numberInputs) {
+      for (const input of valueInputs) {
         const raw = String(input.value ?? '').trim();
         const label = input.dataset.configLabel || input.dataset.configValueKey || '\u53c2\u6570';
         if (!raw) {
@@ -3499,15 +3546,32 @@ HTML = """<!doctype html>
                           <div class="toggle-name">${item.label || item.key || '-'}</div>
                           <div class="toggle-detail">${item.detail || ''}</div>
                         </div>
-                        ${item.type === 'number'
+                        ${item.type === 'pair'
+                          ? `<div class="config-pair-control">
+                              ${(item.fields || []).map(field => `
+                                <div class="config-pair-field">
+                                  <span class="config-pair-label">${field.label || ''}</span>
+                                  <input
+                                    class="config-number-input"
+                                    type="number"
+                                    data-config-value-key="${field.key}"
+                                    data-config-label="${field.label || field.key || ''}"
+                                    min="${field.min ?? 0}"
+                                    step="${field.step ?? 1}"
+                                    value="${field.value ?? ''}"
+                                  >
+                                  <span class="config-number-unit">${field.unit || ''}</span>
+                                </div>
+                              `).join('')}
+                            </div>`
+                          : item.type === 'number' || item.type === 'text'
                           ? `<div class="config-control">
                               <input
                                 class="config-number-input"
-                                type="number"
+                                type="${item.type === 'text' ? 'text' : 'number'}"
                                 data-config-value-key="${item.key}"
                                 data-config-label="${item.label || item.key || ''}"
-                                min="${item.min ?? 0}"
-                                step="${item.step ?? 1}"
+                                ${item.type === 'number' ? `min="${item.min ?? 0}" step="${item.step ?? 1}"` : ''}
                                 value="${item.value ?? ''}"
                               >
                               <span class="config-number-unit">${item.unit || ''}</span>
@@ -4028,6 +4092,54 @@ HTML = """<!doctype html>
           </table>
         </div>
         ${expandBtn}
+      `;
+    }
+
+    function renderStopLossLeaderboard(summary) {
+      const wrap = document.getElementById('stopLossLeaderboardWrap');
+      const meta = document.getElementById('stopLossLeaderboardMeta');
+      const rows = summary?.rows || [];
+      const stats = summary?.summary || {};
+      const stopLossEventCount = Number(stats.stopLossEventCount || 0);
+      const longStopEventCount = Number(stats.longStopEventCount || 0);
+      const shortStopEventCount = Number(stats.shortStopEventCount || 0);
+      const assetCount = Number(stats.assetCount || 0);
+      meta.textContent = `累计硬止损 ${stopLossEventCount} 次，做多硬止损 ${longStopEventCount} 次，做空硬止损 ${shortStopEventCount} 次，涉及 ${assetCount} 个币种。`;
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="empty">暂无止损记录。</div>';
+        return;
+      }
+      wrap.innerHTML = `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>排名</th>
+                <th>合约</th>
+                <th>硬止损总次数</th>
+                <th>做多止损</th>
+                <th>做空止损</th>
+                <th>胜率</th>
+                <th>净盈亏</th>
+                <th>平均收益率</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map((row, index) => `
+                <tr>
+                  <td>${index + 1}</td>
+                  <td>${row.label || row.key || '-'}</td>
+                  <td>${row.stopLossCount ?? row.tradeCount ?? 0}</td>
+                  <td>${row.longStopCount ?? 0}</td>
+                  <td>${row.shortStopCount ?? 0}</td>
+                  <td>${row.winRatePct != null ? `${fmt(row.winRatePct, 2)}%` : '-'}</td>
+                  <td class="${clsByPnl(row.netRealizedPnlUsdt)}">${fmt(row.netRealizedPnlUsdt, 4)} USDT</td>
+                  <td class="${clsByPnl(row.avgReturnPct)}">${row.avgReturnPct != null ? `${fmt(row.avgReturnPct, 2)}%` : '-'}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
       `;
     }
 
@@ -4689,6 +4801,7 @@ HTML = """<!doctype html>
         renderUnopenedCandidates(data.unopenedCandidates || []);
         renderCooldowns(data.cooldownSummary || {}, data.activeCooldowns || []);
         renderBestWorst(data);
+        renderStopLossLeaderboard(data.stopLossLeaderboard || null);
         renderTradeHistory(data.tradeHistory || []);
         renderForceOrders(data.forceOrderSummary || {});
         renderRecoveryStats(data.recoveryStats || null);
@@ -4795,6 +4908,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if key in {"COOLDOWN_MINUTES", "CIRCUIT_BREAKER_COOLDOWN_MINUTES"} and value > 10080:
                     raise ValueError(f"{key} 不能超过 10080 分钟")
                 normalized[key] = str(value)
+                continue
+            if key == "MAINSTREAM_ASSETS":
+                assets: list[str] = []
+                seen: set[str] = set()
+                for chunk in str(raw_value).replace("，", ",").split(","):
+                    asset = chunk.strip().upper()
+                    for suffix in ("USDT", "USDC", "BUSD", "FDUSD"):
+                        if asset.endswith(suffix) and len(asset) > len(suffix):
+                            asset = asset[: -len(suffix)]
+                    if not asset or asset in seen:
+                        continue
+                    seen.add(asset)
+                    assets.append(asset)
+                if not assets:
+                    raise ValueError("MAINSTREAM_ASSETS 不能为空")
+                normalized[key] = ",".join(assets)
                 continue
             try:
                 value = float(str(raw_value).strip())
