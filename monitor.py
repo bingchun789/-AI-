@@ -31,6 +31,9 @@ from ai_select_futures_bot import (
     should_trigger_profit_protection,
     should_trigger_time_exit,
     side_from_position,
+    signal_count_asset_group,
+    signal_count_entry_threshold_for_asset,
+    signal_count_exit_threshold_for_asset,
 )
 
 
@@ -797,6 +800,27 @@ def _entry_audit_toggle_config_mismatches(
         failures.append(
             f"硬止损价格比例记录为 {stop_loss_pct}% ，当前配置应为 {expected_stop_loss_pct}%"
         )
+    asset = str(audit.get("asset") or audit.get("baseAsset") or "")
+    asset_group = audit.get("signalCountEntryAssetGroup")
+    threshold = audit.get("signalCountEntryThreshold")
+    if asset_group not in (None, "") and asset:
+        expected_group = signal_count_asset_group(config, asset)
+        if str(asset_group) != expected_group:
+            failures.append(f"榜单数量开仓分组记录为 {asset_group}，当前应为 {expected_group}")
+    if threshold not in (None, "") and asset:
+        expected_threshold = signal_count_entry_threshold_for_asset(
+            config,
+            str(audit.get("side") or LONG),
+            asset,
+        )
+        try:
+            actual_threshold = int(float(str(threshold)))
+        except Exception:
+            actual_threshold = None
+        if actual_threshold is not None and actual_threshold != expected_threshold:
+            failures.append(
+                f"榜单数量开仓阈值记录为 {actual_threshold}，当前应为 {expected_threshold}"
+            )
     return failures
 
 
@@ -819,6 +843,36 @@ def _disabled_toggle_decision_failures(decision: dict[str, Any], config: Any) ->
         failures.append("趋势确认已关闭，但本轮仍因趋势规则拦截开仓")
     if reason == "signal_drop_guard" and not bool(config.enable_signal_drop_guard):
         failures.append("信号骤降保护已关闭，但本轮仍因该规则阻止平仓")
+    if reason in {"signal_count_entry_gate_blocked", "signal_count_entry_confirming"}:
+        if not bool(config.enable_signal_count_entry_gate):
+            failures.append("榜单数量开仓已关闭，但本轮仍因该规则拦截开仓")
+        asset = str(decision.get("asset") or "")
+        side = str(decision.get("side") or LONG)
+        expected_threshold = signal_count_entry_threshold_for_asset(config, side, asset)
+        actual_threshold = decision.get("requiredSignalCount")
+        try:
+            actual_threshold_int = int(float(str(actual_threshold)))
+        except Exception:
+            actual_threshold_int = None
+        if actual_threshold_int is not None and actual_threshold_int != expected_threshold:
+            failures.append(
+                f"榜单数量开仓阈值记录为 {actual_threshold_int}，当前应为 {expected_threshold}"
+            )
+    if reason in {"signal_count_below_exit_threshold", "signal_count_exit_confirming"}:
+        if not bool(config.enable_signal_count_exit):
+            failures.append("榜单数量平仓已关闭，但本轮仍因该规则触发或等待平仓")
+        asset = str(decision.get("asset") or "")
+        side = str(decision.get("side") or LONG)
+        expected_threshold = signal_count_exit_threshold_for_asset(config, side, asset)
+        actual_threshold = decision.get("exitSignalCountThreshold")
+        try:
+            actual_threshold_int = int(float(str(actual_threshold)))
+        except Exception:
+            actual_threshold_int = None
+        if actual_threshold_int is not None and actual_threshold_int != expected_threshold:
+            failures.append(
+                f"榜单数量平仓阈值记录为 {actual_threshold_int}，当前应为 {expected_threshold}"
+            )
     if reason.startswith("margin_mode_missing:") and not bool(
         config.skip_if_margin_mode_unavailable
     ):
@@ -1565,6 +1619,11 @@ def _entry_audit_failures(audit: dict[str, Any]) -> list[str]:
             failures.append(f"与现有持仓 {correlated_symbol} 相关性过高")
     if audit.get("stopLossEnabled") and not audit.get("stopLossConfigured"):
         failures.append("硬止损未配置成功")
+    if audit.get("signalCountEntryGateEnabled"):
+        candidate_count = int(audit.get("candidateCount", 0) or 0)
+        threshold = int(audit.get("signalCountEntryThreshold", 0) or 0)
+        if candidate_count < threshold:
+            failures.append(f"榜单数量 {candidate_count} 小于开仓门槛 {threshold}")
     opened_before = int(audit.get("openedBefore", 0) or 0)
     cycle_limit = int(audit.get("cycleLimit", 0) or 0)
     if cycle_limit > 0 and opened_before >= cycle_limit:
@@ -1700,6 +1759,15 @@ def _exit_audit_failures(event: dict[str, Any], audit: dict[str, Any]) -> list[s
         confirm_rounds = int(audit.get("signalLostConfirmRounds", 0) or 0)
         if confirm_rounds > 0 and rounds < confirm_rounds:
             failures.append(f"信号丢失轮数 {rounds} 小于确认轮数 {confirm_rounds}")
+    elif reason == "signal_count_below_exit_threshold":
+        if not audit.get("currentSignalCount") and audit.get("currentSignalCount") != 0:
+            failures.append("未记录榜单数量平仓时的当前榜单数量")
+        current_count = int(audit.get("currentSignalCount", 0) or 0)
+        threshold = int(audit.get("exitSignalCountThreshold", 0) or 0)
+        if threshold <= 0:
+            failures.append("未记录榜单数量平仓阈值")
+        elif current_count >= threshold:
+            failures.append(f"当前榜单数量 {current_count} 未低于平仓门槛 {threshold}")
     elif reason == "stop_loss":
         if not audit.get("stopLossEnabled"):
             failures.append("硬止损已关闭却仍然触发该平仓")
