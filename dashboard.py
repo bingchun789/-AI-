@@ -64,7 +64,6 @@ CONFIG_VALUE_KEYS = {
     "CIRCUIT_BREAKER_COOLDOWN_MINUTES",
     "RISK_PER_TRADE_PCT",
     "MIN_NOTIONAL_PER_TRADE_USDT",
-    "MAX_NOTIONAL_PER_TRADE_USDT",
     "MAX_SIDE_OPEN_RISK_PCT",
     "MAX_TOTAL_OPEN_RISK_PCT",
     "MAX_CORRELATED_POSITIONS_PER_SIDE",
@@ -1054,6 +1053,26 @@ HTML = """<!doctype html>
       font-size: 13px;
       white-space: nowrap;
     }
+    .config-derived-box {
+      flex: 0 0 auto;
+      min-width: 260px;
+      max-width: 380px;
+      border: 1px solid color-mix(in srgb, var(--group-accent) 18%, white);
+      border-radius: 12px;
+      background: rgba(255,255,255,.72);
+      padding: 9px 12px;
+      text-align: right;
+    }
+    .config-derived-main {
+      font-weight: 800;
+      color: var(--group-title);
+      margin-bottom: 3px;
+    }
+    .config-derived-sub {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
     .switch {
       position: relative;
       width: 52px;
@@ -1115,6 +1134,7 @@ HTML = """<!doctype html>
       .toggle-item { align-items: flex-start; flex-wrap: wrap; }
       .config-control { width: 100%; justify-content: flex-start; }
       .config-pair-control { width: 100%; justify-content: flex-start; }
+      .config-derived-box { width: 100%; max-width: none; text-align: left; }
     }
   </style>
 </head>
@@ -2990,6 +3010,8 @@ HTML = """<!doctype html>
     let _configAutoSaveSeq = 0;
     let _configAutoSaveInFlight = false;
     let _configOpenGroups = new Set(CONFIG_GROUPS.filter(group => group.defaultOpen).map(group => group.id));
+    let _latestRiskStats = null;
+    let _latestTradingSetup = null;
 
     function defaultConfigMetaText(count) {
       return `共 ${count} 项配置，修改后自动保存，机器人下个轮询周期自动生效。`;
@@ -3028,6 +3050,15 @@ HTML = """<!doctype html>
         const group = CONFIG_GROUP_BY_KEY[item.key];
         const target = group ? groupMap.get(group.id) : fallback;
         target.items.push(configDisplayItem(item));
+      }
+      const positionSizing = groupMap.get('position_sizing');
+      if (positionSizing && positionSizing.items.length && !positionSizing.items.some(item => item.key === 'DERIVED_NOTIONAL_PER_TRADE_USDT')) {
+        positionSizing.items.push({
+          key: 'DERIVED_NOTIONAL_PER_TRADE_USDT',
+          label: '自动推算下单金额',
+          type: 'derived',
+          detail: '根据当前权益、单笔风险预算和硬止损比例自动计算；实际下单还会受交易所数量精度影响。',
+        });
       }
       return [...groups.filter(group => group.items.length), ...(fallback.items.length ? [fallback] : [])];
     }
@@ -3078,6 +3109,9 @@ HTML = """<!doctype html>
         };
         input.addEventListener('input', () => {
           updateDraft();
+          if (['RISK_PER_TRADE_PCT', 'MIN_NOTIONAL_PER_TRADE_USDT', 'STOP_LOSS_PCT'].includes(input.dataset.configValueKey)) {
+            renderConfigToggles(_configToggleItems, { force: true });
+          }
           scheduleConfigAutosave(700);
         });
         input.addEventListener('change', () => {
@@ -3260,7 +3294,7 @@ HTML = """<!doctype html>
       {
         id: 'position_sizing',
         title: '\u98ce\u9669\u4ed3\u4f4d',
-        detail: '\u5355\u7b14\u98ce\u9669\u9884\u7b97\u3001\u5355\u7b14\u6700\u5c0f\u540d\u4e49\u91d1\u989d\u3001\u5355\u7b14\u6700\u5927\u540d\u4e49\u91d1\u989d',
+        detail: '\u5355\u7b14\u98ce\u9669\u9884\u7b97\u3001\u6700\u5c0f\u4ed3\u4f4d\u4e0b\u9650\u548c\u81ea\u52a8\u63a8\u7b97\u7684\u4e0b\u5355\u91d1\u989d',
         accent: '#176b6a',
         border: 'rgba(23,107,106,.24)',
         header: 'rgba(23,107,106,.11)',
@@ -3268,7 +3302,7 @@ HTML = """<!doctype html>
         body: 'rgba(23,107,106,.08)',
         card: 'rgba(244,251,251,.86)',
         titleColor: '#125856',
-        keys: ['ENABLE_RISK_POSITION_SIZING', 'RISK_PER_TRADE_PCT', 'MIN_NOTIONAL_PER_TRADE_USDT', 'MAX_NOTIONAL_PER_TRADE_USDT'],
+        keys: ['ENABLE_RISK_POSITION_SIZING', 'RISK_PER_TRADE_PCT', 'MIN_NOTIONAL_PER_TRADE_USDT', 'DERIVED_NOTIONAL_PER_TRADE_USDT'],
       },
       {
         id: 'portfolio_risk',
@@ -3396,6 +3430,49 @@ HTML = """<!doctype html>
       }
       const source = _configToggleItems.find(item => item.key === toggleKey);
       return Boolean(source?.enabled);
+    }
+
+    function configValue(key) {
+      if (Object.prototype.hasOwnProperty.call(_configDraftValues, key)) {
+        return _configDraftValues[key];
+      }
+      for (const item of _configToggleItems) {
+        if (item.key === key && item.value !== undefined) return item.value;
+        if (item.type === 'pair') {
+          const field = (item.fields || []).find(entry => entry.key === key);
+          if (field && field.value !== undefined) return field.value;
+        }
+      }
+      return null;
+    }
+
+    function renderDerivedConfigItem(item) {
+      if (item.key !== 'DERIVED_NOTIONAL_PER_TRADE_USDT') return '<div class="config-derived-box">-</div>';
+      const equity = Number(_latestRiskStats?.currentEquityUsdt || 0);
+      const riskPct = Number(configValue('RISK_PER_TRADE_PCT') || 0);
+      const stopLossPct = Number(configValue('STOP_LOSS_PCT') || 0);
+      const minNotional = Number(configValue('MIN_NOTIONAL_PER_TRADE_USDT') || 0);
+      const leverage = Number(_latestTradingSetup?.longLeverage || _latestTradingSetup?.shortLeverage || 0);
+      if (!equity || !riskPct || !stopLossPct) {
+        return `
+          <div class="config-derived-box">
+            <div class="config-derived-main">暂时无法推算</div>
+            <div class="config-derived-sub">需要当前权益、单笔风险预算和硬止损比例。</div>
+          </div>
+        `;
+      }
+      const riskBudget = equity * riskPct / 100;
+      const rawNotional = riskBudget * 100 / stopLossPct;
+      const finalNotional = Math.max(rawNotional, minNotional || 0);
+      const margin = leverage > 0 ? finalNotional / leverage : null;
+      const minNote = minNotional > rawNotional ? `；已被最小下单金额抬到 ${fmt(minNotional, 2)} U` : '';
+      return `
+        <div class="config-derived-box">
+          <div class="config-derived-main">预计下单 ${fmt(finalNotional, 2)} U</div>
+          <div class="config-derived-sub">风险预算 ${fmt(riskBudget, 2)} U ÷ 硬止损 ${fmt(stopLossPct, 2)}%${minNote}</div>
+          <div class="config-derived-sub">按 ${leverage || '-'}X 预计保证金 ${margin == null ? '-' : fmt(margin, 2) + ' U'}</div>
+        </div>
+      `;
     }
 
     function shouldRenderConfigItem(item) {
@@ -3548,7 +3625,9 @@ HTML = """<!doctype html>
                           <div class="toggle-name">${item.label || item.key || '-'}</div>
                           <div class="toggle-detail">${item.detail || ''}</div>
                         </div>
-                        ${item.type === 'pair'
+                        ${item.type === 'derived'
+                          ? renderDerivedConfigItem(item)
+                          : item.type === 'pair'
                           ? `<div class="config-pair-control">
                               ${(item.fields || []).map(field => `
                                 <div class="config-pair-field">
@@ -4758,6 +4837,8 @@ HTML = """<!doctype html>
         const res = await fetch(apiUrl);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
+        _latestRiskStats = data.riskStats || null;
+        _latestTradingSetup = data.tradingSetup || null;
         document.getElementById('stamp').textContent = '更新时间: ' + new Date().toLocaleString();
         if (data.dashboardError) {
           setSyncStatus(

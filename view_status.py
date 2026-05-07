@@ -1173,16 +1173,6 @@ def _augment_config_toggles(items: list[dict[str, Any]], config: Any) -> list[di
             "detail": "风险仓位计算后低于这个值会按这个值下单。",
         },
         {
-            "key": "MAX_NOTIONAL_PER_TRADE_USDT",
-            "label": "最大下单金额",
-            "type": "number",
-            "value": float(config.max_notional_per_trade_usdt),
-            "min": 0,
-            "step": 1,
-            "unit": "USDT",
-            "detail": "风险仓位计算后高于这个值会被封顶。",
-        },
-        {
             "key": "ENABLE_PORTFOLIO_RISK_CAP",
             "label": "组合风险限制",
             "enabled": config.enable_portfolio_risk_cap,
