@@ -640,7 +640,7 @@ def _check_strategy_statuses(
     strategy_statuses: dict[str, Any],
     poll_interval_seconds: int,
 ) -> None:
-    stale_threshold = max(poll_interval_seconds * 3, 60)
+    stale_threshold = max(poll_interval_seconds * 3, 120)
     for strategy_id, side in EXPECTED_STRATEGIES.items():
         status = strategy_statuses.get(strategy_id)
         if not isinstance(status, dict):

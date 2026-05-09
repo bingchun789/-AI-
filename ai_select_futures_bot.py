@@ -5659,6 +5659,7 @@ def process_strategy(
                 "estimatedEntryRiskUsdt": format_decimal_value(estimated_entry_risk),
                 "stopLossPrice": opened_position.get("stopLossPrice"),
                 "stopLossStatus": opened_position.get("stopLossStatus"),
+                "entryAudit": entry_audit,
             }
         )
         opened += 1
