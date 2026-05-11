@@ -3691,11 +3691,14 @@ HTML = """<!doctype html>
 
       _configAutoSaveInFlight = true;
       setConfigMetaText('\u6b63\u5728\u81ea\u52a8\u4fdd\u5b58...');
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
       try {
         const res = await fetch(apiUrl('/api/config-toggles'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
+          signal: controller.signal,
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
@@ -3708,10 +3711,15 @@ HTML = """<!doctype html>
       } catch (err) {
         console.error('config autosave failed:', err);
         _configDraftDirty = true;
-        setConfigMetaText(`\u81ea\u52a8\u4fdd\u5b58\u5931\u8d25\uff1a${err.message || err}`);
+        const message = err?.name === 'AbortError' ? '\u8bf7\u6c42\u8d85\u65f6\uff0c\u8bf7\u91cd\u8bd5' : (err.message || err);
+        setConfigMetaText(`\u81ea\u52a8\u4fdd\u5b58\u5931\u8d25\uff1a${message}`);
       } finally {
+        clearTimeout(timeoutId);
         if (requestId === _configAutoSaveSeq) {
           _configAutoSaveInFlight = false;
+          if (_configDraftDirty) {
+            scheduleConfigAutosave(1200);
+          }
         }
       }
     }
