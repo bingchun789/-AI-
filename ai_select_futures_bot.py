@@ -5267,7 +5267,27 @@ def process_strategy(
                 )
                 continue
 
-        quote_volume_24h = broker.get_quote_volume_24h(contract["symbol"])
+        try:
+            quote_volume_24h = broker.get_quote_volume_24h(contract["symbol"])
+        except Exception as exc:
+            logging.warning(
+                "entry_filter_data_unavailable asset=%s symbol=%s side=%s filter=quote_volume error=%s",
+                asset,
+                contract["symbol"],
+                side,
+                exc,
+            )
+            decisions.append(
+                {
+                    "asset": asset,
+                    "side": side,
+                    "action": "skip",
+                    "reason": "market_data_unavailable",
+                    "filter": "quote_volume",
+                    "detail": str(exc),
+                }
+            )
+            continue
         if quote_volume_24h < Decimal(str(config.min_quote_volume_24h_usdt)):
             decisions.append(
                 {
@@ -5284,11 +5304,31 @@ def process_strategy(
             continue
 
         if config.enable_volatility_filter:
-            volatility_klines = broker.get_klines(
-                contract["symbol"],
-                config.volatility_interval,
-                max(2, config.volatility_lookback_bars),
-            )
+            try:
+                volatility_klines = broker.get_klines(
+                    contract["symbol"],
+                    config.volatility_interval,
+                    max(2, config.volatility_lookback_bars),
+                )
+            except Exception as exc:
+                logging.warning(
+                    "entry_filter_data_unavailable asset=%s symbol=%s side=%s filter=volatility error=%s",
+                    asset,
+                    contract["symbol"],
+                    side,
+                    exc,
+                )
+                decisions.append(
+                    {
+                        "asset": asset,
+                        "side": side,
+                        "action": "skip",
+                        "reason": "market_data_unavailable",
+                        "filter": "volatility",
+                        "detail": str(exc),
+                    }
+                )
+                continue
             max_range_pct = candle_max_range_pct(volatility_klines)
             if max_range_pct > Decimal(str(config.max_single_bar_range_pct)):
                 decisions.append(
@@ -5303,7 +5343,27 @@ def process_strategy(
                 continue
 
         if config.enable_funding_rate_filter:
-            funding_rate_pct = abs(broker.get_last_funding_rate_pct(contract["symbol"]))
+            try:
+                funding_rate_pct = abs(broker.get_last_funding_rate_pct(contract["symbol"]))
+            except Exception as exc:
+                logging.warning(
+                    "entry_filter_data_unavailable asset=%s symbol=%s side=%s filter=funding_rate error=%s",
+                    asset,
+                    contract["symbol"],
+                    side,
+                    exc,
+                )
+                decisions.append(
+                    {
+                        "asset": asset,
+                        "side": side,
+                        "action": "skip",
+                        "reason": "market_data_unavailable",
+                        "filter": "funding_rate",
+                        "detail": str(exc),
+                    }
+                )
+                continue
             if funding_rate_pct > Decimal(str(config.max_abs_funding_rate_pct)):
                 decisions.append(
                     {
@@ -5320,11 +5380,31 @@ def process_strategy(
                 continue
 
         if config.enable_trend_confirmation:
-            trend_signal = resolve_trend_confirmation(
-                broker=broker,
-                contract_symbol=contract["symbol"],
-                config=config,
-            )
+            try:
+                trend_signal = resolve_trend_confirmation(
+                    broker=broker,
+                    contract_symbol=contract["symbol"],
+                    config=config,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "entry_filter_data_unavailable asset=%s symbol=%s side=%s filter=trend_confirmation error=%s",
+                    asset,
+                    contract["symbol"],
+                    side,
+                    exc,
+                )
+                decisions.append(
+                    {
+                        "asset": asset,
+                        "side": side,
+                        "action": "skip",
+                        "reason": "market_data_unavailable",
+                        "filter": "trend_confirmation",
+                        "detail": str(exc),
+                    }
+                )
+                continue
             if trend_signal is None:
                 decisions.append(
                     {
@@ -5375,13 +5455,33 @@ def process_strategy(
                 and config.max_correlated_positions_per_side > 0
             )
         ):
-            correlation_summary = summarize_correlated_positions(
-                broker=broker,
-                state=state,
-                side=side,
-                contract_symbol=contract["symbol"],
-                config=config,
-            )
+            try:
+                correlation_summary = summarize_correlated_positions(
+                    broker=broker,
+                    state=state,
+                    side=side,
+                    contract_symbol=contract["symbol"],
+                    config=config,
+                )
+            except Exception as exc:
+                logging.warning(
+                    "entry_filter_data_unavailable asset=%s symbol=%s side=%s filter=correlation error=%s",
+                    asset,
+                    contract["symbol"],
+                    side,
+                    exc,
+                )
+                decisions.append(
+                    {
+                        "asset": asset,
+                        "side": side,
+                        "action": "skip",
+                        "reason": "market_data_unavailable",
+                        "filter": "correlation",
+                        "detail": str(exc),
+                    }
+                )
+                continue
             strongest_correlation = correlation_summary.get("strongest") or {}
             correlated_symbol = strongest_correlation.get("symbol")
             correlated_value = strongest_correlation.get("correlation")
